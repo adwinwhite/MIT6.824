@@ -57,10 +57,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		fmt.Printf("New task: type=%d, id=%s\n", reqReply.Type, reqReply.TaskID)
 		switch reqReply.Err {
-		case "completed":
+		case "Completed":
 			break
 		case "NoMapTaskLeft", "NoReduceTaskLeft", "NoSuchAssignedTaskID", "Sorting":
-			time.Sleep(100 * time.Microsecond)
+			time.Sleep(1000 * time.Microsecond)
 			continue
 		}
 		switch reqReply.Type {
@@ -101,8 +101,12 @@ func execMapTask(workerID string, mapf func(string, string) []KeyValue, reply *R
 	for i := 0; i < reply.NReduce; i++ {
 		// f, err := os.OpenFile("mr-" + reply.TaskID + "-" + strconv.Itoa(i), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		// f, err := os.CreateTemp("", "temp-mr-" + reply.TaskID + "-" + strconv.Itoa(i))
-		tempName := uuid.NewString()
-		f, err := os.CreateTemp(".", tempName)
+		tempName := fmt.Sprint(time.Now().UnixNano())
+		err := os.MkdirAll("./tmpfiles", 0755)
+		if err != nil {
+			return err
+		}
+		f, err := os.Create("./tmpfiles/" + tempName)
 		tempFiles = append(tempFiles, tempName)
 		defer f.Close()
 		if err != nil {
@@ -134,7 +138,7 @@ func execMapTask(workerID string, mapf func(string, string) []KeyValue, reply *R
 		if err != nil {
 			return err
 		}
-		err = os.Rename(tempFiles[i], "mr-" + reply.TaskID + "-" + strconv.Itoa(i))
+		err = os.Rename("./tmpfiles/" + tempFiles[i], "./tmpfiles/mr-" + reply.TaskID + "-" + strconv.Itoa(i))
 		if err != nil {
 			return err
 		}
@@ -148,7 +152,7 @@ func execMapTask(workerID string, mapf func(string, string) []KeyValue, reply *R
 }
 
 func execReduceTask(workerID string, reducef func(string, []string) string, reply *RequestTaskReply) error {
-	f, err := os.Open("mr-reduce-in-" + reply.TaskID)
+	f, err := os.Open("./tmpfiles/mr-reduce-in-" + reply.TaskID)
 	defer f.Close()
 	if err != nil {
 		return err
@@ -157,8 +161,8 @@ func execReduceTask(workerID string, reducef func(string, []string) string, repl
 	decoder := json.NewDecoder(reader)
 
 	// outputFile, err := os.Create("mr-out-" + reply.TaskID)
-	tempName := uuid.NewString()
-	tempFile, err := os.CreateTemp("", tempName)
+	tempName := fmt.Sprint(time.Now().UnixNano())
+	tempFile, err := os.Create("./tmpfiles/" + tempName)
 	defer tempFile.Close()
 
 	if err != nil {
@@ -174,7 +178,7 @@ func execReduceTask(workerID string, reducef func(string, []string) string, repl
 	}
 	tempFile.Sync()
 
-	submitReply, err := SubmitTask(&SubmitTaskArgs{WorkerID: workerID, Type: Map, TaskID: reply.TaskID})
+	submitReply, err := SubmitTask(&SubmitTaskArgs{WorkerID: workerID, Type: Reduce, TaskID: reply.TaskID})
 	fmt.Println("Submitted reduce task", reply.TaskID)
 	if err != nil {
 		return err
@@ -182,12 +186,12 @@ func execReduceTask(workerID string, reducef func(string, []string) string, repl
 	if submitReply.Err != "" {
 		return errors.New(submitReply.Err)
 	}
-	err = os.Rename(tempName, "mr-out-" + reply.TaskID)
+	err = os.Rename("./tmpfiles/" + tempName, "./tmpfiles/mr-out-" + reply.TaskID)
 	if err != nil {
 		return err
 	}
 
-	_, err = ConfirmTask(&ConfirmTaskArgs{Type: Map, TaskID: reply.TaskID})
+	_, err = ConfirmTask(&ConfirmTaskArgs{Type: Reduce, TaskID: reply.TaskID})
 	if err != nil {
 		return err
 	}

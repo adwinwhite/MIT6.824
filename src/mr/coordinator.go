@@ -233,7 +233,7 @@ func (c *Coordinator) sortMapResults() error {
 	for i := 0; i < c.nReduce; i++ {
 		kvl := make(map[string][]string)
 		for j := 0; j < c.nMap; j++ {
-			f, err := os.Open("mr-" + strconv.Itoa(j) + "-" + strconv.Itoa(i))
+			f, err := os.Open("./tmpfiles/mr-" + strconv.Itoa(j) + "-" + strconv.Itoa(i))
 			defer f.Close()
 			if err != nil {
 				return err
@@ -252,7 +252,7 @@ func (c *Coordinator) sortMapResults() error {
 				}
 			}
 		}
-		f, err := os.Create("mr-reduce-in-" + strconv.Itoa(i))
+		f, err := os.Create("./tmpfiles/mr-reduce-in-" + strconv.Itoa(i))
 		defer f.Close()
 		if err != nil {
 			return err
@@ -265,7 +265,18 @@ func (c *Coordinator) sortMapResults() error {
 				return err
 			}
 		}
+		err = writer.Flush()
+		if err != nil {
+			return err
+		}
+		err = f.Sync()
+		if err != nil {
+			return err
+		}
 	}
+
+	c.stage = Reducing
+	fmt.Println("Entered reducing stage")
 
 	return nil
 }
