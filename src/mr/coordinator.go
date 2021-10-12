@@ -9,177 +9,257 @@ import "time"
 import "sync"
 import "strconv"
 
+type TaskStage int
 
+const (
+	Mapping TaskStage = iota
+	Sorting
+	Reducing
+	Completed
+)
 
 type TaskInfo struct {
-	workerID string
-	status TaskStatus
+	workerID  string
+	taskType  TaskType
+	taskID    string
+	inputFile string
 }
 
+// I need a database. Considering no performance here
 type Coordinator struct {
-	mu sync.Mutex
-	mapResultSorted bool
-	inputFiles []string
-	mapTaskInfo []TaskInfo
-	reduceTaskInfo []TaskInfo
+	stage          TaskStage
+	pendingTasks   []TaskInfo
+	assignedTasks  []TaskInfo
+	finishedTasks  []TaskInfo
+	taskStatusLock sync.Mutex
+	inputFiles     []string
 }
 
-// Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) mapTaskDone() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, info := range c.mapTaskInfo {
-		if info.status != Finished {
-			return false
+func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) {
+	switch c.stage {
+	case Mapping:
+		c.getMapTask(args, reply)
+	case Sorting:
+		reply.Err = "Sorting"
+	case Reducing:
+		c.getReduceTask(args, reply)
+	case Completed:
+		reply.Err = "Completed"
+	}
+}
+
+func (c *Coordinator) SubmitTask(args *SubmitTaskArgs, reply *SubmitTaskReply) {
+	switch c.stage {
+	case Mapping:
+		c.submitMapTask(args, reply)
+	case Sorting:
+		reply.Err = "Sorting"
+	case Reducing:
+		c.submitReduceTask(args, reply)
+	case Completed:
+		reply.Err = "Completed"
+	}
+}
+
+func (c *Coordinator) ConfirmTask(args *ConfirmTaskArgs, reply *ConfirmTaskReply) {
+	switch c.stage {
+	case Mapping:
+		c.confirmMapTask(args, reply)
+	case Reducing:
+		c.confirmReduceTask(args, reply)
+	}
+}
+
+func removeTask(s []TaskInfo, i int) []TaskInfo {
+	s[i] = s[len(s)-1]
+	return s[:len(s)-1]
+}
+
+
+func (c *Coordinator) reassignTask(info TaskInfo) {
+	timer := time.NewTimer(10 * time.Second)
+	<-timer.C
+	c.taskStatusLock.Lock()
+	defer c.taskStatusLock.Unlock()
+	for i, t := range c.assignedTasks {
+		if t.taskType == info.taskType && t.taskID == info.taskID {
+			info.workerID = ""
+			c.pendingTasks = append(c.pendingTasks, info)
+			c.assignedTasks = removeTask(c.assignedTasks, i)
+			return
 		}
 	}
-	return true
 }
 
-func (c *Coordinator) Dispatch(args *DispatchArgs, reply *DispatchReply) { 
-	if c.mapTaskDone() {
-		reply.Type = Reduce
-	} else {
-		reply.Type = Map
+
+
+func (c *Coordinator) getMapTask(args *RequestTaskArgs, reply *RequestTaskReply) {
+	c.taskStatusLock.Lock()
+	defer c.taskStatusLock.Unlock()
+	for i, info := range c.pendingTasks {
+		if info.taskType == Map {
+			reply.Type = Map
+			reply.InputFile = info.inputFile
+			reply.TaskID = info.taskID
+			reply.Err = ""
+			info.workerID = args.WorkerID
+			c.assignedTasks = append(c.assignedTasks, info)
+			c.pendingTasks = removeTask(c.pendingTasks, i)
+
+			go c.reassignTask(info)
+				
+			return
+		}
 	}
+	reply.Err = "NoMapTaskLeft"
 	return
 }
 
-func (c *Coordinator) GetMapTask(args *GetMapTaskArgs, reply *GetMapTaskReply) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for i, info := range c.mapTaskInfo {
-		if info.status == Pending {
-			c.mapTaskInfo[i].workerID = args.WorkerID
-			c.mapTaskInfo[i].status = Assigned
+func (c *Coordinator) getReduceTask(args *RequestTaskArgs, reply *RequestTaskReply) {
+	c.taskStatusLock.Lock()
+	defer c.taskStatusLock.Unlock()
+	for i, info := range c.pendingTasks {
+		if info.taskType == Reduce {
+			reply.Type = Reduce
+			reply.InputFile = info.inputFile
+			reply.TaskID = info.taskID
 			reply.Err = ""
-			reply.MapID = i
-			reply.InputFile = c.inputFiles[i]
-			go func() {
-				t := time.NewTimer(10 * time.Second)
-				<-t.C
-				c.mu.Lock()
-				defer c.mu.Unlock()
-				if c.mapTaskInfo[i].status != Finished {
-					c.mapTaskInfo[i].status = Pending
-					c.mapTaskInfo[i].workerID = ""
-				}
-				return
-			}()
+			info.workerID = args.WorkerID
+			c.assignedTasks = append(c.assignedTasks, info)
+			c.pendingTasks = removeTask(c.pendingTasks, i)
+
+			go c.reassignTask(info)
 
 			return
 		}
 	}
-	reply.Err = "no map task left"
-	return 
+	reply.Err = "NoReduceTaskLeft"
+	return
 }
 
-func (c *Coordinator) checkMapStatusAndSort() error {
-	if c.mapResultSorted {
-		return nil
+func (c *Coordinator) submitMapTask(args *SubmitTaskArgs, reply *SubmitTaskReply) {
+	if args.Type != Map {
+		reply.Err = "TaskTypeError"
+		return
 	}
-	if c.mapTaskDone() {
+	c.taskStatusLock.Lock()
+	defer c.taskStatusLock.Unlock()
+	for _, info := range c.assignedTasks {
+		if info.taskID == args.TaskID {
+			if info.workerID == args.WorkerID {
+				reply.Err = ""
+				return
+			} else {
+				reply.Err = "WrongWorkerID"
+				return
+			}
+		}
+	}
+	reply.Err = "NoSuchAssignedTaskID"
+	return
+}
 
+func (c *Coordinator) submitReduceTask(args *SubmitTaskArgs, reply *SubmitTaskReply) {
+	if args.Type != Reduce {
+		reply.Err = "TaskTypeError"
+		return
 	}
+	c.taskStatusLock.Lock()
+	defer c.taskStatusLock.Unlock()
+	for _, info := range c.assignedTasks {
+		if info.taskID == args.TaskID {
+			if info.workerID == args.WorkerID {
+				reply.Err = ""
+				return
+			} else {
+				reply.Err = "WrongWorkerID"
+				return
+			}
+		}
+	}
+	reply.Err = "NoSuchAssignedTaskID"
+	return
+}
+
+func (c *Coordinator) confirmMapTask(args *ConfirmTaskArgs, reply *ConfirmTaskReply) {
+	if args.Type != Map {
+		return
+	}
+	c.taskStatusLock.Lock()
+	for i, info := range c.assignedTasks {
+		if info.taskType == Map && info.taskID == args.TaskID {
+			c.finishedTasks = append(c.finishedTasks, info)
+			c.assignedTasks = removeTask(c.assignedTasks, i)
+			c.taskStatusLock.Unlock()
+
+			c.updateTaskStage()
+			if c.stage == Sorting {
+				c.sortMapResults()
+			}
+
+			return
+		}
+	}
+}
+
+func (c *Coordinator) confirmReduceTask(args *ConfirmTaskArgs, reply *ConfirmTaskReply) {
+	if args.Type != Reduce {
+		return
+	}
+	c.taskStatusLock.Lock()
+	for i, info := range c.assignedTasks {
+		if info.taskType == Reduce && info.taskID == args.TaskID {
+			c.finishedTasks = append(c.finishedTasks, info)
+			c.assignedTasks = removeTask(c.assignedTasks, i)
+			c.taskStatusLock.Unlock()
+
+			c.updateTaskStage()
+			return
+		}
+	}
+}
+
+func (c *Coordinator) sortMapResults() error {
 	return nil
 }
 
-
-
-func (c *Coordinator) SummitMapResult(args *SummitMapResultArgs, reply *SummitMapResultReply) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	info := c.mapTaskInfo[args.MapID]
-	if info.workerID == args.WorkerID && info.status == Assigned {
-		reply.Err = ""
-		reply.Success = true
-		return
-	}
-	reply.Err = "worker id changed or status isn't assigned"
-	reply.Success = false
-	return
-}
-
-func (c *Coordinator) ConfirmMapResultArgs(args *ConfirmMapResultArgs, reply *ConfirmMapResultReply) {
-	c.mu.Lock()
-	c.mapTaskInfo[args.MapID].status = Finished
-	c.mu.Unlock()
-
-	c.checkMapStatusAndSort()
-}
-
-
-func (c *Coordinator) SummitReduceResult(args *SummitReduceResultArgs, reply *SummitReduceResultReply) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	info := c.reduceTaskInfo[args.ReduceID]
-	if info.workerID == args.WorkerID && info.status == Assigned {
-		reply.Err = ""
-		reply.Success = true
-		return
-	}
-	reply.Err = "worker id changed or status isn't assigned"
-	reply.Success = false
-	return
-}
-
-func (c *Coordinator) ConfirmReduceResultArgs(args *ConfirmReduceResultArgs, reply *ConfirmReduceResultReply) {
-	c.mu.Lock()
-	c.reduceTaskInfo[args.ReduceID].status = Finished
-	c.mu.Unlock()
-}
-
-
-
-func (c *Coordinator) GetReduceTask(args *GetReduceTaskArgs, reply *GetReduceTaskReply) {
-	if !c.mapTaskDone() {
-		reply.Err = "map tasks haven't been finished"
-		return
-	}
-	if !c.mapResultSorted {
-		reply.Err = "map results haven't been sorted"
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for i, info := range c.reduceTaskInfo {
-		if info.status == Pending {
-			c.reduceTaskInfo[i].workerID = args.WorkerID
-			c.reduceTaskInfo[i].status = Assigned
-			reply.Err = ""
-			reply.ReduceID = i
-			reply.InputFile = "mr-inter-" + strconv.Itoa(i)
-			go func() {
-				t := time.NewTimer(10 * time.Second)
-				<-t.C
-				c.mu.Lock()
-				defer c.mu.Unlock()
-				if c.reduceTaskInfo[i].status != Finished {
-					c.reduceTaskInfo[i].status = Pending
-					c.reduceTaskInfo[i].workerID = ""
-				}
+func (c *Coordinator) updateTaskStage() {
+	c.taskStatusLock.Lock()
+	defer c.taskStatusLock.Unlock()
+	switch c.stage {
+	case Mapping:
+		for _, info := range c.pendingTasks {
+			if info.taskType == Map {
 				return
-			}()
-
-			return
+			}
 		}
+		for _, info := range c.assignedTasks {
+			if info.taskType == Map {
+				return
+			}
+		}
+		c.stage = Sorting
+	case Reducing:
+		for _, info := range c.pendingTasks {
+			if info.taskType == Reduce {
+				return
+			}
+		}
+		for _, info := range c.assignedTasks {
+			if info.taskType == Reduce {
+				return
+			}
+		}
+		c.stage = Completed
 	}
-	reply.Err = "no reduce task left"
 	return
 }
-
-
-
-
-
 
 //
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -202,16 +282,7 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, info := range c.reduceTaskInfo {
-		if info.status != Finished {
-			return false
-		}
-	}
-
-	return true
+	return c.stage == Completed
 }
 
 //
@@ -223,7 +294,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Initiate tasks status
-	c.mapResultSorted = false
 	c.inputFiles = files
 	for _, _ = range files {
 		c.mapTaskInfo = append(c.mapTaskInfo, TaskInfo{"", Pending})

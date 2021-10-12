@@ -14,13 +14,13 @@ import "strconv"
 // and reply for an RPC.
 //
 
-type TaskStatus int
+// type TaskStatus int
 
-const (
-	Pending TaskStatus = iota
-	Assigned 
-	Finished
-)
+// const (
+	// Pending TaskStatus = iota
+	// Assigned
+	// Finished
+// )
 
 type TaskType int
 
@@ -30,67 +30,35 @@ const (
 	Reduce
 )
 
-
-
-
-type DispatchArgs struct {}
-
-type DispatchReply struct {
-	 Type TaskType
-}
-
-type GetMapTaskArgs struct {
+type RequestTaskArgs struct {
 	WorkerID string
 }
 
-type GetMapTaskReply struct {
-	Err string
-	MapID int
+type RequestTaskReply struct {
+	Type TaskType
 	InputFile string
-}
-
-type GetReduceTaskArgs struct {
-	WorkerID string
-}
-
-type GetReduceTaskReply struct {
+	TaskID string
 	Err string
-	ReduceID int
-	InputFile string
 }
 
-type SummitMapResultArgs struct {
+type SubmitTaskArgs struct {
 	WorkerID string
-	MapID int
+	Type TaskType
+	TaskID string
 }
 
-type SummitMapResultReply struct {
+type SubmitTaskReply struct {
 	Err string
-	Success bool
 }
 
-type ConfirmMapResultArgs struct {
-	MapID int
+type ConfirmTaskArgs struct {
+	Type TaskType
+	TaskID string
 }
 
-type ConfirmMapResultReply struct {}
+type ConfirmTaskReply struct {}
 
-// Add your RPC definitions here.
-type SummitReduceResultArgs struct {
-	WorkerID string
-	ReduceID int
-}
 
-type SummitReduceResultReply struct {
-	Err string
-	Success bool
-}
-
-type ConfirmReduceResultArgs struct {
-	ReduceID int
-}
-
-type ConfirmReduceResultReply struct {}
 
 
 // Cook up a unique-ish UNIX-domain socket name
