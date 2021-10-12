@@ -38,6 +38,7 @@ type RequestTaskReply struct {
 	Type TaskType
 	InputFile string
 	TaskID string
+	NReduce int
 	Err string
 }
 

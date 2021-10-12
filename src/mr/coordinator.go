@@ -1,5 +1,6 @@
 package mr
 
+import "fmt"
 import "log"
 import "net"
 import "os"
@@ -8,6 +9,8 @@ import "net/http"
 import "time"
 import "sync"
 import "strconv"
+import "encoding/json"
+import "bufio"
 
 type TaskStage int
 
@@ -32,10 +35,11 @@ type Coordinator struct {
 	assignedTasks  []TaskInfo
 	finishedTasks  []TaskInfo
 	taskStatusLock sync.Mutex
-	inputFiles     []string
+	nReduce        int
+	nMap           int
 }
 
-func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) {
+func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
 	switch c.stage {
 	case Mapping:
 		c.getMapTask(args, reply)
@@ -46,9 +50,10 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	case Completed:
 		reply.Err = "Completed"
 	}
+	return nil
 }
 
-func (c *Coordinator) SubmitTask(args *SubmitTaskArgs, reply *SubmitTaskReply) {
+func (c *Coordinator) SubmitTask(args *SubmitTaskArgs, reply *SubmitTaskReply) error {
 	switch c.stage {
 	case Mapping:
 		c.submitMapTask(args, reply)
@@ -59,22 +64,23 @@ func (c *Coordinator) SubmitTask(args *SubmitTaskArgs, reply *SubmitTaskReply) {
 	case Completed:
 		reply.Err = "Completed"
 	}
+	return nil
 }
 
-func (c *Coordinator) ConfirmTask(args *ConfirmTaskArgs, reply *ConfirmTaskReply) {
+func (c *Coordinator) ConfirmTask(args *ConfirmTaskArgs, reply *ConfirmTaskReply) error {
 	switch c.stage {
 	case Mapping:
 		c.confirmMapTask(args, reply)
 	case Reducing:
 		c.confirmReduceTask(args, reply)
 	}
+	return nil
 }
 
 func removeTask(s []TaskInfo, i int) []TaskInfo {
 	s[i] = s[len(s)-1]
 	return s[:len(s)-1]
 }
-
 
 func (c *Coordinator) reassignTask(info TaskInfo) {
 	timer := time.NewTimer(10 * time.Second)
@@ -91,8 +97,6 @@ func (c *Coordinator) reassignTask(info TaskInfo) {
 	}
 }
 
-
-
 func (c *Coordinator) getMapTask(args *RequestTaskArgs, reply *RequestTaskReply) {
 	c.taskStatusLock.Lock()
 	defer c.taskStatusLock.Unlock()
@@ -102,12 +106,13 @@ func (c *Coordinator) getMapTask(args *RequestTaskArgs, reply *RequestTaskReply)
 			reply.InputFile = info.inputFile
 			reply.TaskID = info.taskID
 			reply.Err = ""
+			reply.NReduce = c.nReduce
 			info.workerID = args.WorkerID
 			c.assignedTasks = append(c.assignedTasks, info)
 			c.pendingTasks = removeTask(c.pendingTasks, i)
 
 			go c.reassignTask(info)
-				
+
 			return
 		}
 	}
@@ -124,6 +129,7 @@ func (c *Coordinator) getReduceTask(args *RequestTaskArgs, reply *RequestTaskRep
 			reply.InputFile = info.inputFile
 			reply.TaskID = info.taskID
 			reply.Err = ""
+			reply.NReduce = c.nReduce
 			info.workerID = args.WorkerID
 			c.assignedTasks = append(c.assignedTasks, info)
 			c.pendingTasks = removeTask(c.pendingTasks, i)
@@ -148,6 +154,7 @@ func (c *Coordinator) submitMapTask(args *SubmitTaskArgs, reply *SubmitTaskReply
 		if info.taskID == args.TaskID {
 			if info.workerID == args.WorkerID {
 				reply.Err = ""
+				fmt.Println("Accepted submission", args.Type, args.TaskID)
 				return
 			} else {
 				reply.Err = "WrongWorkerID"
@@ -170,6 +177,7 @@ func (c *Coordinator) submitReduceTask(args *SubmitTaskArgs, reply *SubmitTaskRe
 		if info.taskID == args.TaskID {
 			if info.workerID == args.WorkerID {
 				reply.Err = ""
+				fmt.Println("Accepted submission", args.Type, args.TaskID)
 				return
 			} else {
 				reply.Err = "WrongWorkerID"
@@ -191,6 +199,7 @@ func (c *Coordinator) confirmMapTask(args *ConfirmTaskArgs, reply *ConfirmTaskRe
 			c.finishedTasks = append(c.finishedTasks, info)
 			c.assignedTasks = removeTask(c.assignedTasks, i)
 			c.taskStatusLock.Unlock()
+			fmt.Println("Confirmed map task submission", args.TaskID)
 
 			c.updateTaskStage()
 			if c.stage == Sorting {
@@ -212,6 +221,7 @@ func (c *Coordinator) confirmReduceTask(args *ConfirmTaskArgs, reply *ConfirmTas
 			c.finishedTasks = append(c.finishedTasks, info)
 			c.assignedTasks = removeTask(c.assignedTasks, i)
 			c.taskStatusLock.Unlock()
+			fmt.Println("Confirmed reduce task submission", args.TaskID)
 
 			c.updateTaskStage()
 			return
@@ -220,6 +230,43 @@ func (c *Coordinator) confirmReduceTask(args *ConfirmTaskArgs, reply *ConfirmTas
 }
 
 func (c *Coordinator) sortMapResults() error {
+	for i := 0; i < c.nReduce; i++ {
+		kvl := make(map[string][]string)
+		for j := 0; j < c.nMap; j++ {
+			f, err := os.Open("mr-" + strconv.Itoa(j) + "-" + strconv.Itoa(i))
+			defer f.Close()
+			if err != nil {
+				return err
+			}
+			reader := bufio.NewReader(f)
+			dec := json.NewDecoder(reader)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				if _, ok := kvl[kv.Key]; ok {
+					kvl[kv.Key] = append(kvl[kv.Key], kv.Value)
+				} else {
+					kvl[kv.Key] = []string{kv.Value}
+				}
+			}
+		}
+		f, err := os.Create("mr-reduce-in-" + strconv.Itoa(i))
+		defer f.Close()
+		if err != nil {
+			return err
+		}
+		writer := bufio.NewWriter(f)
+		enc := json.NewEncoder(writer)
+		for k, v := range kvl {
+			err := enc.Encode(&KeyValueList{k, v})
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -239,6 +286,7 @@ func (c *Coordinator) updateTaskStage() {
 			}
 		}
 		c.stage = Sorting
+		fmt.Println("Entered sorting stage")
 	case Reducing:
 		for _, info := range c.pendingTasks {
 			if info.taskType == Reduce {
@@ -251,6 +299,7 @@ func (c *Coordinator) updateTaskStage() {
 			}
 		}
 		c.stage = Completed
+		fmt.Println("Task completed")
 	}
 	return
 }
@@ -293,16 +342,16 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
-	// Initiate tasks status
-	c.inputFiles = files
-	for _, _ = range files {
-		c.mapTaskInfo = append(c.mapTaskInfo, TaskInfo{"", Pending})
+	c.nReduce = nReduce
+	c.nMap = len(files)
+	// Initiate pendingTasks
+	for i, f := range files {
+		c.pendingTasks = append(c.pendingTasks, TaskInfo{workerID: "", taskType: Map, taskID: strconv.Itoa(i), inputFile: f})
 	}
 
 	for i := 0; i < nReduce; i++ {
-		c.reduceTaskInfo = append(c.reduceTaskInfo, TaskInfo{"", Pending})
+		c.pendingTasks = append(c.pendingTasks, TaskInfo{workerID: "", taskType: Reduce, taskID: strconv.Itoa(i), inputFile: "mr-reduce-in-" + strconv.Itoa(i)})
 	}
-
 	c.server()
 	return &c
 }
