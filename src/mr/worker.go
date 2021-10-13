@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"log"
+	log "github.com/sirupsen/logrus"
 	"net/rpc"
 	"os"
 	"strconv"
@@ -52,36 +52,32 @@ func Worker(mapf func(string, string) []KeyValue,
 		reqArgs := RequestTaskArgs{WorkerID: workerID}
 		reqReply, err := RequestTask(&reqArgs)
 		if err != nil {
-			fmt.Println(err)
+			log.Error(err)
 			continue
 		}
-		fmt.Printf("New task: type=%d, id=%s\n", reqReply.Type, reqReply.TaskID)
 		switch reqReply.Err {
 		case "Completed":
+			log.Info("All tasks completed")
 			break
 		case "NoMapTaskLeft", "NoReduceTaskLeft", "NoSuchAssignedTaskID", "Sorting":
-			time.Sleep(1000 * time.Microsecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		switch reqReply.Type {
 		case Map:
+			log.Info("New map task", reqReply.TaskID)
 			err := execMapTask(workerID, mapf, reqReply)
 			if err != nil {
-				fmt.Println(err)
+				log.Error(err)
 			}
 		case Reduce:
+			log.Info("New reduce task", reqReply.TaskID)
 			err := execReduceTask(workerID, reducef, reqReply)
 			if err != nil {
-				fmt.Println(err)
+				log.Error(err)
 			}
 		}
 	}
-
-
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
 }
 
 //
@@ -126,7 +122,7 @@ func execMapTask(workerID string, mapf func(string, string) []KeyValue, reply *R
 		}
 	}
 	submitReply, err := SubmitTask(&SubmitTaskArgs{WorkerID: workerID, Type: Map, TaskID: reply.TaskID})
-	fmt.Println("Submitted map task", reply.TaskID)
+	log.Info("Submitted map task", reply.TaskID)
 	if err != nil {
 		return err
 	}
@@ -179,14 +175,14 @@ func execReduceTask(workerID string, reducef func(string, []string) string, repl
 	tempFile.Sync()
 
 	submitReply, err := SubmitTask(&SubmitTaskArgs{WorkerID: workerID, Type: Reduce, TaskID: reply.TaskID})
-	fmt.Println("Submitted reduce task", reply.TaskID)
+	log.Info("Submitted reduce task", reply.TaskID)
 	if err != nil {
 		return err
 	}
 	if submitReply.Err != "" {
 		return errors.New(submitReply.Err)
 	}
-	err = os.Rename("./tmpfiles/" + tempName, "./tmpfiles/mr-out-" + reply.TaskID)
+	err = os.Rename("./tmpfiles/" + tempName, "./mr-out-" + reply.TaskID)
 	if err != nil {
 		return err
 	}
@@ -242,7 +238,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-
-	fmt.Println(err)
+	log.Error(err)
 	return false
 }

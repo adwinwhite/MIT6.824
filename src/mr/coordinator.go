@@ -1,7 +1,7 @@
 package mr
 
 import "fmt"
-import "log"
+import log "github.com/sirupsen/logrus"
 import "net"
 import "os"
 import "net/rpc"
@@ -230,6 +230,8 @@ func (c *Coordinator) confirmReduceTask(args *ConfirmTaskArgs, reply *ConfirmTas
 }
 
 func (c *Coordinator) sortMapResults() error {
+	c.taskStatusLock.Lock()
+	defer c.taskStatusLock.Unlock()
 	for i := 0; i < c.nReduce; i++ {
 		kvl := make(map[string][]string)
 		for j := 0; j < c.nMap; j++ {
@@ -342,7 +344,10 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	return c.stage == Completed
+	c.taskStatusLock.Lock()
+	done := c.stage == Completed
+	defer c.taskStatusLock.Unlock()
+	return done
 }
 
 //
