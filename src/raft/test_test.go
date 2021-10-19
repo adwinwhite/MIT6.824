@@ -14,6 +14,7 @@ import "time"
 import "math/rand"
 import "sync/atomic"
 import "sync"
+import log "github.com/sirupsen/logrus"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -104,6 +105,7 @@ func TestManyElections2A(t *testing.T) {
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)
+		log.Info(i1, ", ", i2, ", ", i3, " disconnected from the network")
 
 		// either the current leader should still be alive,
 		// or the remaining four should elect a new one.
@@ -112,6 +114,7 @@ func TestManyElections2A(t *testing.T) {
 		cfg.connect(i1)
 		cfg.connect(i2)
 		cfg.connect(i3)
+		log.Info(i1, ", ", i2, ", ", i3, " connected to the network")
 	}
 
 	cfg.checkOneLeader()

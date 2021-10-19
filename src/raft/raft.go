@@ -73,14 +73,14 @@ const (
 )
 
 const (
-	CollectVotesTimeout time.Duration = 500 * time.Millisecond //1s
+	CollectVotesTimeout time.Duration = 1000 * time.Millisecond //1s
 )
 
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	me        int64                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
@@ -89,8 +89,7 @@ type Raft struct {
 	// Persistent state
 	currentTerm int64
 	termMutex   sync.Mutex
-	votedFor    int
-	votedMutex  sync.Mutex
+	votedFor    int64
 	log         []LogEntry
 	logMutex    sync.Mutex
 
@@ -118,48 +117,45 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) becomeFollower() {
-	log.WithFields(log.Fields{
-		"term": atomic.LoadInt64(&rf.currentTerm),
-	}).Info(rf.me, " becomes a follower")
 	// if atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Leader), (int32)(Follower)) || atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Candidate), (int32)(Follower)) {}
 	atomic.StoreInt32((*int32)(&rf.role), (int32)(Follower))
-	rf.votedMutex.Lock()
-	defer rf.votedMutex.Unlock()
-	rf.votedFor = -1
+	atomic.StoreInt64(&rf.votedFor, -1)
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+	}).Info(rf.me, " became a follower")
 }
 
 func (rf *Raft) becomeLeader() bool {
-	log.WithFields(log.Fields{
-		"term": atomic.LoadInt64(&rf.currentTerm),
-	}).Info(rf.me, " becomes the leader")
 	if !atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Candidate), (int32)(Leader)) {
 		return false
 	}
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.logMutex.Lock()
-	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log)
-	}
+	logLength := len(rf.log)
 	rf.logMutex.Unlock()
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = logLength
+	}
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+	}).Info(rf.me, " became the leader")
 	return true
 }
 
 func (rf *Raft) becomeCandidate() {
-	log.WithFields(log.Fields{
-		"term": atomic.LoadInt64(&rf.currentTerm),
-	}).Info(rf.me, " becomes a candidate")
 	atomic.StoreInt32((*int32)(&rf.role), (int32)(Candidate))
 	// rf.termMutex.Lock()
 	// defer rf.termMutex.Unlock()
-	term := rf.currentTerm
+	term := atomic.LoadInt64(&rf.currentTerm)
 	atomic.StoreInt64(&rf.currentTerm, term + 1) 
-	rf.votedMutex.Lock()
-	defer rf.votedMutex.Unlock()
-	rf.votedFor = rf.me
+	atomic.StoreInt64(&rf.votedFor, (int64)(rf.me))
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+	}).Info(rf.me, " became a candidate")
 }
 
 
@@ -228,7 +224,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term         int64
-	CandidateId  int
+	CandidateId  int64
 	LastLogIndex int
 	LastLogTerm  int64
 }
@@ -249,6 +245,9 @@ func (rf *Raft) cancelElectionOrNoNeed() {
 	if rf.cancelElection != nil {
 		rf.cancelElection()
 		rf.cancelElection = nil
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, " canceled election")
 	}
 }
 
@@ -259,6 +258,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// rf.termMutex.Lock()
 	reply.Term = atomic.LoadInt64(&rf.currentTerm)
+	log.WithFields(log.Fields{
+		"term": reply.Term,
+	}).Info(rf.me, " received vote request from ", args.CandidateId)
 	if args.Term < reply.Term {
 		log.WithFields(log.Fields{
 			"term": reply.Term,
@@ -267,24 +269,29 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	} else if args.Term > reply.Term {
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
-		rf.becomeFollower()
+		if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Leader) {
+			rf.becomeFollower()
+		} 
+
 	}
 	// rf.termMutex.Unlock()
 
 
-	rf.votedMutex.Lock()
-	defer rf.votedMutex.Unlock()
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	whoIVotedFor := atomic.LoadInt64(&rf.votedFor)
+	if whoIVotedFor == -1 || whoIVotedFor == args.CandidateId {
 		rf.logMutex.Lock()
 		defer rf.logMutex.Unlock()
 		if (len(rf.log) == 0 && ((args.LastLogTerm == 0 && args.LastLogIndex == -1) || (args.LastLogTerm > 0))) || (len(rf.log) > 0 && ((args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)) || (args.LastLogTerm > rf.log[len(rf.log)-1].Term))) {
+			if args.CandidateId != rf.me {
+				rf.becomeFollower()
+			}
+			reply.VoteGranted = true
+			atomic.StoreInt64(&rf.votedFor, args.CandidateId)
+
+			rf.cancelElectionOrNoNeed()
 			log.WithFields(log.Fields{
 				"term": reply.Term,
 			}).Info(rf.me, " voted for ", args.CandidateId)
-			reply.VoteGranted = true
-			rf.votedFor = args.CandidateId
-
-			rf.cancelElectionOrNoNeed()
 			return
 		} else {
 			log.WithFields(log.Fields{
@@ -294,7 +301,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		log.WithFields(log.Fields{
 			"term": atomic.LoadInt64(&rf.currentTerm),
-		}).Info(rf.me, " refused to vote for ", args.CandidateId, " due to having voted for another")
+		}).Info(rf.me, " refused to vote for ", args.CandidateId, " due to having voted for ", whoIVotedFor)
 	}
 	reply.VoteGranted = false
 	return
@@ -337,13 +344,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) collectVotes() (err error) {
 	cv := make(chan RequestVoteReply)
 	var lastLogTerm int64 = 0
+	var term int64 = atomic.LoadInt64(&rf.currentTerm)
+	// log.WithFields(log.Fields{
+		// "term": term,
+	// }).Info(rf.me, " tried to lock log")
 	rf.logMutex.Lock()
 	if len(rf.log) > 0 {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
-	var term int64 = atomic.LoadInt64(&rf.currentTerm)
 	args := RequestVoteArgs{Term: term, CandidateId: rf.me, LastLogIndex: len(rf.log) - 1, LastLogTerm: lastLogTerm}
 	rf.logMutex.Unlock()
+	// log.WithFields(log.Fields{
+		// "term": term,
+	// }).Info(rf.me, " unlocked log")
 	for i := 0; i < len(rf.peers); i++ {
 		go func(i int) {
 			var reply RequestVoteReply
@@ -372,6 +385,9 @@ func (rf *Raft) collectVotes() (err error) {
 			// rf.termMutex.Unlock()
 			if reply.VoteGranted {
 				votesCount++
+				log.WithFields(log.Fields{
+					"term": atomic.LoadInt64(&rf.currentTerm),
+				}).Info(rf.me, " has ", votesCount, " votes granted now")
 			}
 			if votesCount * 2 > len(rf.peers) {
 				if rf.becomeLeader() {
@@ -390,7 +406,7 @@ func (rf *Raft) collectVotes() (err error) {
 
 type AppendEntriesArgs struct {
 	Term         int64
-	LeaderId     int
+	LeaderId     int64
 	PrevLogIndex int
 	PrevLogTerm  int64
 	Entries      []LogEntry
@@ -406,21 +422,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Check term
 	// rf.termMutex.Lock()
 	reply.Term = atomic.LoadInt64(&rf.currentTerm)
-	rf.votedMutex.Lock()
 	if args.Term < reply.Term {
 		reply.Success = false
 		return
-	} else if args.Term > reply.Term {
+	} else {
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
-		rf.becomeFollower()
-		rf.votedFor = args.LeaderId
+		if args.LeaderId != rf.me {
+			rf.becomeFollower()
+		}
+		atomic.StoreInt64(&rf.votedFor, args.LeaderId)
 	}
 	// rf.termMutex.Unlock()
 
-	if args.LeaderId == rf.votedFor {
+	if args.LeaderId == atomic.LoadInt64(&rf.votedFor) {
 		rf.cancelElectionOrNoNeed()
 	}
-	rf.votedMutex.Unlock()
 
 	// initial empty heartbeat
 	if args.PrevLogIndex < 0 {
@@ -514,7 +530,7 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		sleeptime := 200+rand.Int63n(300)
+		sleeptime := 100+rand.Int63n(500)
 		log.WithFields(log.Fields{
 			"term": atomic.LoadInt64(&rf.currentTerm),
 		}).Info(rf.me, " will start election in ", sleeptime, " milliseconds")
@@ -601,7 +617,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
-	rf.me = me
+	rf.me = (int64)(me)
+	rf.votedFor = -1
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.lastApplied = -1
