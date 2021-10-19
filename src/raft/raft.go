@@ -61,10 +61,10 @@ type ApplyMsg struct {
 
 type LogEntry struct {
 	Content string
-	Term    int
+	Term    int64
 }
 
-type RaftRole int
+type RaftRole int32
 
 const (
 	Follower RaftRole = iota
@@ -73,7 +73,7 @@ const (
 )
 
 const (
-	CollectVotesTimeout int64 = 1000 //1s
+	CollectVotesTimeout time.Duration = 500 * time.Millisecond //1s
 )
 
 type Raft struct {
@@ -87,9 +87,12 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	// Persistent state
-	currentTerm int
+	currentTerm int64
+	termMutex   sync.Mutex
 	votedFor    int
+	votedMutex  sync.Mutex
 	log         []LogEntry
+	logMutex    sync.Mutex
 
 	// Volatile state
 	commitIndex int
@@ -111,28 +114,54 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	// Your code here (2A).
-	return rf.currentTerm, rf.role == Leader
+	return (int)(atomic.LoadInt64(&rf.currentTerm)), atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Leader)
 }
 
 func (rf *Raft) becomeFollower() {
-	log.Info(rf.me, " becomes a follower")
-	rf.role = Follower
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+	}).Info(rf.me, " becomes a follower")
+	// if atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Leader), (int32)(Follower)) || atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Candidate), (int32)(Follower)) {}
+	atomic.StoreInt32((*int32)(&rf.role), (int32)(Follower))
+	rf.votedMutex.Lock()
+	defer rf.votedMutex.Unlock()
 	rf.votedFor = -1
 }
 
-func (rf *Raft) becomeLeader() {
-	log.Info(rf.me, " becomes the leader")
-	rf.role = Leader
+func (rf *Raft) becomeLeader() bool {
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+	}).Info(rf.me, " becomes the leader")
+	if !atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Candidate), (int32)(Leader)) {
+		return false
+	}
 	rf.nextIndex = make([]int, len(rf.peers))
+	rf.logMutex.Lock()
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = len(rf.log)
 	}
+	rf.logMutex.Unlock()
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
-	go rf.talkPeriodically()
+	return true
 }
+
+func (rf *Raft) becomeCandidate() {
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+	}).Info(rf.me, " becomes a candidate")
+	atomic.StoreInt32((*int32)(&rf.role), (int32)(Candidate))
+	// rf.termMutex.Lock()
+	// defer rf.termMutex.Unlock()
+	term := rf.currentTerm
+	atomic.StoreInt64(&rf.currentTerm, term + 1) 
+	rf.votedMutex.Lock()
+	defer rf.votedMutex.Unlock()
+	rf.votedFor = rf.me
+}
+
 
 //
 // save Raft's persistent state to stable storage,
@@ -198,10 +227,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
+	Term         int64
 	CandidateId  int
 	LastLogIndex int
-	LastLogTerm  int
+	LastLogTerm  int64
 }
 
 //
@@ -210,7 +239,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
+	Term        int64
 	VoteGranted bool
 }
 
@@ -228,29 +257,44 @@ func (rf *Raft) cancelElectionOrNoNeed() {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
-		log.Info(rf.me, " refused to vote for ", args.CandidateId, " due to outdated term")
+	// rf.termMutex.Lock()
+	reply.Term = atomic.LoadInt64(&rf.currentTerm)
+	if args.Term < reply.Term {
+		log.WithFields(log.Fields{
+			"term": reply.Term,
+		}).Info(rf.me, " refused to vote for ", args.CandidateId, " due to outdated term")
 		reply.VoteGranted = false
 		return
-	} else {
-		rf.currentTerm = args.Term
+	} else if args.Term > reply.Term {
+		atomic.StoreInt64(&rf.currentTerm, args.Term)
+		rf.becomeFollower()
 	}
+	// rf.termMutex.Unlock()
 
+
+	rf.votedMutex.Lock()
+	defer rf.votedMutex.Unlock()
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.logMutex.Lock()
+		defer rf.logMutex.Unlock()
 		if (len(rf.log) == 0 && ((args.LastLogTerm == 0 && args.LastLogIndex == -1) || (args.LastLogTerm > 0))) || (len(rf.log) > 0 && ((args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)) || (args.LastLogTerm > rf.log[len(rf.log)-1].Term))) {
-			log.Info(rf.me, " voted for ", args.CandidateId)
+			log.WithFields(log.Fields{
+				"term": reply.Term,
+			}).Info(rf.me, " voted for ", args.CandidateId)
 			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
 
 			rf.cancelElectionOrNoNeed()
 			return
 		} else {
-			log.Info(rf.me, " refused to vote for ", args.CandidateId, " since log does not match")
+			log.WithFields(log.Fields{
+				"term": atomic.LoadInt64(&rf.currentTerm),
+			}).Info(rf.me, " refused to vote for ", args.CandidateId, " since log does not match")
 		}
 	} else {
-		log.Info(rf.me, " refused to vote for ", args.CandidateId, " due to having voted for another")
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, " refused to vote for ", args.CandidateId, " due to having voted for another")
 	}
 	reply.VoteGranted = false
 	return
@@ -292,11 +336,14 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) collectVotes() (err error) {
 	cv := make(chan RequestVoteReply)
-	lastLogTerm := 0
+	var lastLogTerm int64 = 0
+	rf.logMutex.Lock()
 	if len(rf.log) > 0 {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
-	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: len(rf.log) - 1, LastLogTerm: lastLogTerm}
+	var term int64 = atomic.LoadInt64(&rf.currentTerm)
+	args := RequestVoteArgs{Term: term, CandidateId: rf.me, LastLogIndex: len(rf.log) - 1, LastLogTerm: lastLogTerm}
+	rf.logMutex.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		go func(i int) {
 			var reply RequestVoteReply
@@ -306,60 +353,74 @@ func (rf *Raft) collectVotes() (err error) {
 			}
 		}(i)
 	}
-	log.Info(rf.me, " requested votes")
-	start := time.Now()
+	log.WithFields(log.Fields{
+		"term": term,
+	}).Info(rf.me, " requested votes")
 	var reply RequestVoteReply
 	var votesCount int
+	ctx, cancel := context.WithTimeout(context.Background(), CollectVotesTimeout)
+	defer cancel()
 	for {
-		if time.Now().Sub(start).Milliseconds() > CollectVotesTimeout {
-			log.Info(rf.me, " have been collecting votes for too long")
+		select {
+		case reply = <-cv:
+			// rf.termMutex.Lock()
+			if reply.Term > term {
+				rf.becomeFollower()
+				atomic.StoreInt64(&rf.currentTerm, reply.Term)
+				return errors.New("larger term")
+			}
+			// rf.termMutex.Unlock()
+			if reply.VoteGranted {
+				votesCount++
+			}
+			if votesCount * 2 > len(rf.peers) {
+				if rf.becomeLeader() {
+					go rf.talkPeriodically()
+				}
+				return nil
+			}
+		case <-ctx.Done():
+			log.WithFields(log.Fields{
+				"term": atomic.LoadInt64(&rf.currentTerm),
+			}).Info(rf.me, " have been collecting votes for too long")
 			return errors.New("timeout")
-		}
-		reply = <-cv
-		if reply.Term > rf.currentTerm {
-			rf.becomeFollower()
-			rf.currentTerm = reply.Term
-			return errors.New("larger term")
-		}
-		if reply.VoteGranted {
-			votesCount++
-		}
-		if votesCount*2 > len(rf.peers) {
-			rf.becomeLeader()
-			return nil
 		}
 	}
 }
 
 type AppendEntriesArgs struct {
-	Term         int
+	Term         int64
 	LeaderId     int
 	PrevLogIndex int
-	PrevLogTerm  int
+	PrevLogTerm  int64
 	Entries      []LogEntry
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term    int
+	Term    int64
 	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Check term
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	// rf.termMutex.Lock()
+	reply.Term = atomic.LoadInt64(&rf.currentTerm)
+	rf.votedMutex.Lock()
+	if args.Term < reply.Term {
 		reply.Success = false
 		return
-	} else {
-		rf.currentTerm = args.Term
+	} else if args.Term > reply.Term {
+		atomic.StoreInt64(&rf.currentTerm, args.Term)
+		rf.becomeFollower()
+		rf.votedFor = args.LeaderId
 	}
+	// rf.termMutex.Unlock()
 
 	if args.LeaderId == rf.votedFor {
 		rf.cancelElectionOrNoNeed()
 	}
+	rf.votedMutex.Unlock()
 
 	// initial empty heartbeat
 	if args.PrevLogIndex < 0 {
@@ -367,6 +428,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.logMutex.Lock()
+	defer rf.logMutex.Unlock()
 	if len(rf.log)-1 < args.PrevLogIndex {
 		reply.Success = false
 		return
@@ -451,20 +514,20 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		sleeptime := 500+rand.Int63n(300)
-		log.Info(rf.me, " will start election in ", sleeptime, " milliseconds")
+		sleeptime := 200+rand.Int63n(300)
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, " will start election in ", sleeptime, " milliseconds")
 		ctx, cancel := context.WithCancel(context.Background())
 		rf.cancelMutex.Lock()
 		rf.cancelElection = cancel
 		rf.cancelMutex.Unlock()
 		select {
 		case <-time.After((time.Duration)(sleeptime) * time.Millisecond):
-			if rf.role == Follower {
-				rf.role = Candidate
-				rf.currentTerm++
-				rf.votedFor = rf.me
-			}
-			rf.collectVotes()
+			// if atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Follower) {
+			rf.becomeCandidate()
+			// }
+			go rf.collectVotes()
 		case <-ctx.Done():
 			continue
 		}
@@ -477,40 +540,43 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) talkPeriodically() {
-	for rf.role == Leader {
+	for atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Leader) {
+		rf.logMutex.Lock()
+		logLength := len(rf.log)
+		rf.logMutex.Unlock()
+		term := atomic.LoadInt64(&rf.currentTerm)
 		for i := 0; i < len(rf.peers); i++ {
-			go func(i int) {
+			go func(i int, l int) {
 				var args AppendEntriesArgs
 				var reply AppendEntriesReply
-				if len(rf.log) < rf.nextIndex[i]+1 {
-					args = AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: -1, PrevLogTerm: 0, Entries: []LogEntry{}, LeaderCommit: rf.commitIndex}
+				if l < rf.nextIndex[i]+1 {
+					args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: -1, PrevLogTerm: 0, Entries: []LogEntry{}, LeaderCommit: rf.commitIndex}
 					rf.sendAppendEntries(i, &args, &reply)
 					return
 				}
 
 				ok := false
 				for !ok {
-					logLength := len(rf.log)
-					args = AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: rf.nextIndex[i] - 1, PrevLogTerm: rf.log[rf.nextIndex[i]-1].Term, Entries: rf.log[rf.nextIndex[i]:logLength], LeaderCommit: rf.commitIndex}
+					args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: rf.nextIndex[i] - 1, PrevLogTerm: rf.log[rf.nextIndex[i]-1].Term, Entries: rf.log[rf.nextIndex[i]:l], LeaderCommit: rf.commitIndex}
 					ok := rf.sendAppendEntries(i, &args, &reply)
 					if ok {
-						rf.nextIndex[i] = logLength
+						rf.nextIndex[i] = l
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
 						break
 					} else {
 						rf.nextIndex[i]--
 					}
 				}
-			}(i)
+			}(i, logLength)
 		}
-		for i := len(rf.log) - 1; i > rf.commitIndex; i++ {
+		for i := logLength - 1; i > rf.commitIndex; i++ {
 			countMatch := 0
 			for _, v := range rf.matchIndex {
 				if v >= i {
 					countMatch++
 				}
 			}
-			if countMatch*2 > len(rf.peers) && rf.log[i].Term == rf.currentTerm {
+			if countMatch * 2 > len(rf.peers) && rf.log[i].Term == term {
 				rf.commitIndex = i
 				break
 			}
