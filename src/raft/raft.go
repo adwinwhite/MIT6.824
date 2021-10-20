@@ -24,11 +24,11 @@ import (
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"context"
 	"errors"
+	log "github.com/sirupsen/logrus"
 	"math/rand"
 	"time"
-	"context"
-	log "github.com/sirupsen/logrus"
 )
 
 //
@@ -60,7 +60,7 @@ type ApplyMsg struct {
 //
 
 type LogEntry struct {
-	Content string
+	Command interface{}
 	Term    int64
 }
 
@@ -74,38 +74,40 @@ const (
 
 const (
 	CollectVotesTimeout time.Duration = 1000 * time.Millisecond //1s
+	ElectionTimerBase time.Duration = 200 * time.Millisecond
 )
 
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
-	me        int64                 // this peer's index into peers[]
+	me        int64               // this peer's index into peers[]
 	dead      int32               // set by Kill()
+
+	applyCh chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	// Persistent state
 	currentTerm int64
-	termMutex   sync.Mutex
 	votedFor    int64
 	log         []LogEntry
 	logMutex    sync.Mutex
 
 	// Volatile state
-	commitIndex int
-	lastApplied int
+	commitIndex int64
+	commitIndexMutex sync.Mutex
+	lastApplied int64
 
 	// Volatile state for leader
-	nextIndex  []int
-	matchIndex []int
+	nextIndex  []int64
+	matchIndex []int64
 
 	//
-	role          RaftRole
+	role           RaftRole
 	cancelElection context.CancelFunc
 	cancelMutex    sync.Mutex
-
 }
 
 // return currentTerm and whether this server
@@ -120,23 +122,23 @@ func (rf *Raft) becomeFollower() {
 	// if atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Leader), (int32)(Follower)) || atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Candidate), (int32)(Follower)) {}
 	atomic.StoreInt32((*int32)(&rf.role), (int32)(Follower))
 	atomic.StoreInt64(&rf.votedFor, -1)
-	log.WithFields(log.Fields{
-		"term": atomic.LoadInt64(&rf.currentTerm),
-	}).Info(rf.me, " became a follower")
+	// log.WithFields(log.Fields{
+	// "term": atomic.LoadInt64(&rf.currentTerm),
+	// }).Info(rf.me, " became a follower")
 }
 
 func (rf *Raft) becomeLeader() bool {
 	if !atomic.CompareAndSwapInt32((*int32)(&rf.role), (int32)(Candidate), (int32)(Leader)) {
 		return false
 	}
-	rf.nextIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int64, len(rf.peers))
 	rf.logMutex.Lock()
-	logLength := len(rf.log)
+	logLength := (int64)(len(rf.log))
 	rf.logMutex.Unlock()
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = logLength
 	}
-	rf.matchIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int64, len(rf.peers))
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
@@ -151,13 +153,12 @@ func (rf *Raft) becomeCandidate() {
 	// rf.termMutex.Lock()
 	// defer rf.termMutex.Unlock()
 	term := atomic.LoadInt64(&rf.currentTerm)
-	atomic.StoreInt64(&rf.currentTerm, term + 1) 
+	atomic.StoreInt64(&rf.currentTerm, term+1)
 	atomic.StoreInt64(&rf.votedFor, (int64)(rf.me))
 	log.WithFields(log.Fields{
 		"term": atomic.LoadInt64(&rf.currentTerm),
 	}).Info(rf.me, " became a candidate")
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -227,6 +228,7 @@ type RequestVoteArgs struct {
 	CandidateId  int64
 	LastLogIndex int
 	LastLogTerm  int64
+	CommitIndex  int64
 }
 
 //
@@ -245,9 +247,10 @@ func (rf *Raft) cancelElectionOrNoNeed() {
 	if rf.cancelElection != nil {
 		rf.cancelElection()
 		rf.cancelElection = nil
-		log.WithFields(log.Fields{
-			"term": atomic.LoadInt64(&rf.currentTerm),
-		}).Info(rf.me, " canceled election")
+		// atomic.StorePointer(&unsafe.Pointer(&rf.cancelElection), nil)
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " canceled election")
 	}
 }
 
@@ -256,32 +259,60 @@ func (rf *Raft) cancelElectionOrNoNeed() {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// rf.termMutex.Lock()
-	reply.Term = atomic.LoadInt64(&rf.currentTerm)
+	prevTerm := atomic.LoadInt64(&rf.currentTerm)
+	reply.Term = prevTerm
+
 	log.WithFields(log.Fields{
-		"term": reply.Term,
+		"term": prevTerm,
 	}).Info(rf.me, " received vote request from ", args.CandidateId)
-	if args.Term < reply.Term {
+
+	if args.Term < prevTerm {
 		log.WithFields(log.Fields{
-			"term": reply.Term,
+			"term": prevTerm,
 		}).Info(rf.me, " refused to vote for ", args.CandidateId, " due to outdated term")
 		reply.VoteGranted = false
 		return
-	} else if args.Term > reply.Term {
+	}  
+
+	// When candidate's term is greater than mine, set my term equal to it
+	if args.Term > prevTerm {
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
+
+
+		// If I don't become follower then everyone will just vote for itself and nobody can get elected.
+		// Nonono, whoever has higher term will get elected since the candidate of lower term becomes follower after receiving response
+		// if atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Candidate) {
+			// rf.becomeFollower()
+		// }
+
+		// When increasing term, reset votedFor to null
 		if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Leader) {
 			rf.becomeFollower()
-		} 
+		} //else {
+			// reply.VoteGranted = false
+			// return
+		// }
+
 
 	}
-	// rf.termMutex.Unlock()
 
+	// If there are only two peers remaining online, one established leader with lower commitIndex, the other candidate with higher commitIndex, then I'd like to pick the one with higher commitIndex as leader
+	// Suppose now the candidate requests vote from the leader
+	if atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Leader) && args.CommitIndex > atomic.LoadInt64(&rf.commitIndex) {
+		rf.becomeFollower()
+	}
+
+
+	// rf.termMutex.Unlock()
+	// if atomic.LoadInt64(&rf.commitIndex) < args.CommitIndex {
+		// rf.becomeFollower()
+	// }
 
 	whoIVotedFor := atomic.LoadInt64(&rf.votedFor)
 	if whoIVotedFor == -1 || whoIVotedFor == args.CandidateId {
 		rf.logMutex.Lock()
 		defer rf.logMutex.Unlock()
-		if (len(rf.log) == 0 && ((args.LastLogTerm == 0 && args.LastLogIndex == -1) || (args.LastLogTerm > 0))) || (len(rf.log) > 0 && ((args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)) || (args.LastLogTerm > rf.log[len(rf.log)-1].Term))) {
+		if (args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex + 1 >= len(rf.log)) || (args.LastLogTerm > rf.log[len(rf.log)-1].Term) {
 			if args.CandidateId != rf.me {
 				rf.becomeFollower()
 			}
@@ -290,7 +321,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 			rf.cancelElectionOrNoNeed()
 			log.WithFields(log.Fields{
-				"term": reply.Term,
+				"term": prevTerm,
 			}).Info(rf.me, " voted for ", args.CandidateId)
 			return
 		} else {
@@ -301,6 +332,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		log.WithFields(log.Fields{
 			"term": atomic.LoadInt64(&rf.currentTerm),
+			"commitIndex": atomic.LoadInt64(&rf.commitIndex),
 		}).Info(rf.me, " refused to vote for ", args.CandidateId, " due to having voted for ", whoIVotedFor)
 	}
 	reply.VoteGranted = false
@@ -343,21 +375,21 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) collectVotes() (err error) {
 	cv := make(chan RequestVoteReply)
-	var lastLogTerm int64 = 0
+	lastLogTerm := rf.log[len(rf.log)-1].Term
 	var term int64 = atomic.LoadInt64(&rf.currentTerm)
 	// log.WithFields(log.Fields{
-		// "term": term,
+	// "term": term,
 	// }).Info(rf.me, " tried to lock log")
 	rf.logMutex.Lock()
-	if len(rf.log) > 0 {
-		lastLogTerm = rf.log[len(rf.log)-1].Term
-	}
-	args := RequestVoteArgs{Term: term, CandidateId: rf.me, LastLogIndex: len(rf.log) - 1, LastLogTerm: lastLogTerm}
+	args := RequestVoteArgs{Term: term, CandidateId: rf.me, LastLogIndex: len(rf.log) - 1, LastLogTerm: lastLogTerm, CommitIndex: atomic.LoadInt64(&rf.commitIndex)}
 	rf.logMutex.Unlock()
 	// log.WithFields(log.Fields{
-		// "term": term,
+	// "term": term,
 	// }).Info(rf.me, " unlocked log")
 	for i := 0; i < len(rf.peers); i++ {
+		if (int64)(i) == rf.me {
+			continue
+		}
 		go func(i int) {
 			var reply RequestVoteReply
 			ok := rf.sendRequestVote(i, &args, &reply)
@@ -379,6 +411,7 @@ func (rf *Raft) collectVotes() (err error) {
 			// rf.termMutex.Lock()
 			if reply.Term > term {
 				rf.becomeFollower()
+				rf.cancelElectionOrNoNeed()
 				atomic.StoreInt64(&rf.currentTerm, reply.Term)
 				return errors.New("larger term")
 			}
@@ -389,7 +422,7 @@ func (rf *Raft) collectVotes() (err error) {
 					"term": atomic.LoadInt64(&rf.currentTerm),
 				}).Info(rf.me, " has ", votesCount, " votes granted now")
 			}
-			if votesCount * 2 > len(rf.peers) {
+			if (votesCount + 1) * 2 > len(rf.peers) {
 				if rf.becomeLeader() {
 					go rf.talkPeriodically()
 				}
@@ -407,10 +440,10 @@ func (rf *Raft) collectVotes() (err error) {
 type AppendEntriesArgs struct {
 	Term         int64
 	LeaderId     int64
-	PrevLogIndex int
+	PrevLogIndex int64
 	PrevLogTerm  int64
 	Entries      []LogEntry
-	LeaderCommit int
+	LeaderCommit int64
 }
 
 type AppendEntriesReply struct {
@@ -419,60 +452,121 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Check term
-	// rf.termMutex.Lock()
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+		"commitIndex": atomic.LoadInt64(&rf.commitIndex),
+	}).Info(rf.me, " receives append entries from ", args.LeaderId)
+	log.Info(args)
+
 	reply.Term = atomic.LoadInt64(&rf.currentTerm)
+	reply.Success = true
 	if args.Term < reply.Term {
 		reply.Success = false
+		log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, " appends nothing since the leader has outdated term")
 		return
 	} else {
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
-		if args.LeaderId != rf.me {
-			rf.becomeFollower()
-		}
+	}
+
+
+	rf.commitIndexMutex.Lock()
+	defer rf.commitIndexMutex.Unlock()
+	prevCommitIndex := atomic.LoadInt64(&rf.commitIndex)
+	// if two leaders met
+	if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Follower) && atomic.LoadInt64(&rf.commitIndex) <= args.LeaderCommit {
+		rf.becomeFollower()
 		atomic.StoreInt64(&rf.votedFor, args.LeaderId)
 	}
-	// rf.termMutex.Unlock()
 
 	if args.LeaderId == atomic.LoadInt64(&rf.votedFor) {
 		rf.cancelElectionOrNoNeed()
 	}
 
-	// initial empty heartbeat
-	if args.PrevLogIndex < 0 {
-		reply.Success = true
+	// if meeting with outdated leader
+	// log.Info(rf.me, " has commitIndex ", prevCommitIndex, " and the leader ", args.LeaderId, " has commitIndex ", args.LeaderCommit)
+	if prevCommitIndex > args.LeaderCommit {
+		reply.Success = false
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, " appends nothing since I have greater commitIndex than the leader")
 		return
 	}
+
+	// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// "commitIndex": atomic.LoadInt64(&rf.commitIndex),
+	// }).Info(rf.me, " receives append entries from ", args.LeaderId)
+	// log.Info(args)
+
+
+
+
 
 	rf.logMutex.Lock()
-	defer rf.logMutex.Unlock()
-	if len(rf.log)-1 < args.PrevLogIndex {
+
+
+	if (int64)(len(rf.log)-1) < args.PrevLogIndex {
 		reply.Success = false
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, " appends nothing due to intermediate entries absent")
 		return
 	}
+
 
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		log.Info(rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
 		reply.Success = false
 		return
 	}
 
-	for i := args.PrevLogIndex + 1; i < len(rf.log); i++ {
-		if rf.log[i].Term != args.Entries[i-args.PrevLogIndex-1].Term {
-			rf.log = rf.log[:i]
+
+	appendStartIndex := -1
+	for i, v := range args.Entries {
+		if i + (int)(args.PrevLogIndex) + 1 > len(rf.log) - 1 {
+			appendStartIndex = i
+			break
+		}
+		if rf.log[i + (int)(args.PrevLogIndex) + 1].Term != v.Term {
+			rf.log = rf.log[:i + (int)(args.PrevLogIndex) + 1]
+			appendStartIndex = i
 			break
 		}
 	}
 
-	rf.log = append(rf.log, args.Entries...)
+	// if len(args.Entries) > 0 {
+		// log.Info("nonzero entries received")
+	// }
 
-	if args.LeaderCommit > rf.commitIndex {
-		if args.LeaderCommit < len(rf.log)-1 {
-			rf.commitIndex = args.LeaderCommit
-		} else {
-			rf.commitIndex = len(rf.log) - 1
-		}
+
+	if appendStartIndex >= 0 {
+		rf.log = append(rf.log, args.Entries[appendStartIndex:]...)
 	}
-	reply.Success = true
+	rf.logMutex.Unlock()
+
+	if args.LeaderCommit > prevCommitIndex {
+		if args.LeaderCommit < (int64)(len(rf.log)-1) {
+			atomic.StoreInt64(&rf.commitIndex, args.LeaderCommit)
+		} else {
+			atomic.StoreInt64(&rf.commitIndex, (int64)(len(rf.log) - 1))
+		}
+		rf.sendApplyMsg((int)(prevCommitIndex) + 1, (int)(atomic.LoadInt64(&rf.commitIndex) + 1))
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+			"commit": atomic.LoadInt64(&rf.commitIndex),
+		}).Info(rf.me, " updates commitIndex to ", atomic.LoadInt64(&rf.commitIndex))
+	}
+
+	log.WithFields(log.Fields{
+		"term": atomic.LoadInt64(&rf.currentTerm),
+	}).Info(rf.me, " perhaps added some entries, not sure ")
+
+
 	return
 }
 
@@ -497,12 +591,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
+	isLeader := atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Leader)
+	if isLeader {
+		rf.logMutex.Lock()
+		rf.log = append(rf.log, LogEntry{Command: command, Term: atomic.LoadInt64(&rf.currentTerm)})
+		index = len(rf.log) - 1
+		rf.logMutex.Unlock()
+	}
 
 	// Your code here (2B).
 
-	return index, term, isLeader
+	return index, (int)(atomic.LoadInt64(&rf.currentTerm)), isLeader
 }
 
 //
@@ -530,10 +629,10 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		sleeptime := 100+rand.Int63n(500)
-		log.WithFields(log.Fields{
-			"term": atomic.LoadInt64(&rf.currentTerm),
-		}).Info(rf.me, " will start election in ", sleeptime, " milliseconds")
+		sleeptime := 100 + rand.Int63n(500)
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " will start election in ", sleeptime, " milliseconds")
 		ctx, cancel := context.WithCancel(context.Background())
 		rf.cancelMutex.Lock()
 		rf.cancelElection = cancel
@@ -558,48 +657,106 @@ func (rf *Raft) ticker() {
 func (rf *Raft) talkPeriodically() {
 	for atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Leader) {
 		rf.logMutex.Lock()
-		logLength := len(rf.log)
+		logLength := (int64)(len(rf.log))
+		// log.WithFields(log.Fields{
+			// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " has log of length ", logLength, " as the leader")
 		rf.logMutex.Unlock()
 		term := atomic.LoadInt64(&rf.currentTerm)
+		leaderCommit := atomic.LoadInt64(&rf.commitIndex)
+
+		// imitate sending appendEntries to leader itself
+		rf.cancelElectionOrNoNeed()
+		rf.nextIndex[rf.me] = logLength
+		rf.matchIndex[rf.me] = rf.nextIndex[rf.me] - 1
 		for i := 0; i < len(rf.peers); i++ {
-			go func(i int, l int) {
+			if (int64)(i) == rf.me {
+				continue
+			}
+			go func(i int, logLength int64, leaderCommit int64) {
+				log.WithFields(log.Fields{
+					"term": atomic.LoadInt64(&rf.currentTerm),
+				}).Info(rf.me, " sends AppendEntries to ", i)
+
 				var args AppendEntriesArgs
 				var reply AppendEntriesReply
-				if l < rf.nextIndex[i]+1 {
-					args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: -1, PrevLogTerm: 0, Entries: []LogEntry{}, LeaderCommit: rf.commitIndex}
-					rf.sendAppendEntries(i, &args, &reply)
-					return
+				nextIndex := atomic.LoadInt64(&rf.nextIndex[i])
+				rf.logMutex.Lock()
+				prevLogTerm := rf.log[nextIndex-1].Term
+				if logLength < nextIndex+1 {
+					args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: nextIndex - 1, PrevLogTerm: prevLogTerm, Entries: []LogEntry{}, LeaderCommit: leaderCommit}
+				} else {
+					args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: nextIndex - 1, PrevLogTerm: prevLogTerm, Entries: rf.log[nextIndex:logLength], LeaderCommit: leaderCommit}
 				}
+				rf.logMutex.Unlock()
 
-				ok := false
-				for !ok {
-					args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: rf.nextIndex[i] - 1, PrevLogTerm: rf.log[rf.nextIndex[i]-1].Term, Entries: rf.log[rf.nextIndex[i]:l], LeaderCommit: rf.commitIndex}
-					ok := rf.sendAppendEntries(i, &args, &reply)
-					if ok {
-						rf.nextIndex[i] = l
-						rf.matchIndex[i] = rf.nextIndex[i] - 1
-						break
+				// log.WithFields(log.Fields{
+					// "term": atomic.LoadInt64(&rf.currentTerm),
+				// }).Info(rf.me, " sends non-initial AppendEntries ", i, " as the leader")
+
+
+
+				// if len(rf.log[nextIndex:logLength]) > 0 {
+					// log.Info("nonzero entries sent", nextIndex, logLength)
+				// }
+
+
+				// time reply. Thus invalidate old leader's requests
+				// t1 := time.Now()
+				ok := rf.sendAppendEntries(i, &args, &reply)
+				// if time.Since(t1) >= ElectionTimerBase / 4 {
+					// ok = false
+				// }
+				log.WithFields(log.Fields{
+					"term": atomic.LoadInt64(&rf.currentTerm),
+					"nextIndex": logLength,
+				}).Info(rf.me, " succeeds to append ", i, " : ", ok)
+				if ok {
+					if reply.Term > term {
+						atomic.StoreInt64(&rf.currentTerm, reply.Term)
+					}
+					if reply.Success {
+						// log.Info(args)
+						atomic.StoreInt64(&rf.nextIndex[i], logLength)
+						atomic.StoreInt64(&rf.matchIndex[i], logLength - 1)
+						// break
 					} else {
-						rf.nextIndex[i]--
+						if nextIndex > 1 {
+							atomic.StoreInt64(&rf.nextIndex[i], nextIndex - 1)
+						}
 					}
 				}
-			}(i, logLength)
+			}(i, logLength, leaderCommit)
 		}
-		for i := logLength - 1; i > rf.commitIndex; i++ {
+		prevCommitIndex := atomic.LoadInt64(&rf.commitIndex)
+		for i := int64(logLength - 1); i > prevCommitIndex; i-- {
 			countMatch := 0
-			for _, v := range rf.matchIndex {
-				if v >= i {
+			for j := 0; j < len(rf.peers); j++ {
+				if atomic.LoadInt64(&rf.matchIndex[j]) >= i {
 					countMatch++
 				}
 			}
-			if countMatch * 2 > len(rf.peers) && rf.log[i].Term == term {
-				rf.commitIndex = i
+			if countMatch*2 > len(rf.peers) && rf.log[i].Term == term {
+				atomic.StoreInt64(&rf.commitIndex, i)
+				// rf.logMutex.Lock()
+				rf.sendApplyMsg((int)(prevCommitIndex) + 1, (int)(i) + 1)
+				// rf.logMutex.Unlock()
+				log.WithFields(log.Fields{
+					"term": atomic.LoadInt64(&rf.currentTerm),
+				}).Info(rf.me, " commits up to ", i, " as the leader")
 				break
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+func (rf *Raft) sendApplyMsg(start int, end int) {
+	for i := start; i < end; i++ {
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+	}
+}
+
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -619,10 +776,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = (int64)(me)
 	rf.votedFor = -1
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.lastApplied = -1
+	rf.lastApplied = 0
 	rf.role = Follower
+	rf.commitIndex = 0
+	rf.log = append(rf.log, LogEntry{Command: 0, Term: 0})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

@@ -160,6 +160,7 @@ func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 			// ignore other types of ApplyMsg
 		} else {
 			cfg.mu.Lock()
+			log.Println(i, " committed command ", m.Command, " with index ", m.CommandIndex)
 			err_msg, prevok := cfg.checkLogs(i, m)
 			cfg.mu.Unlock()
 			if m.CommandIndex > 1 && prevok == false {
@@ -535,6 +536,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 				time.Sleep(20 * time.Millisecond)
 			}
+			log.Println("overtime")
 			if retry == false {
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}
