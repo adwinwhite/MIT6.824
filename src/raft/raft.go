@@ -24,6 +24,8 @@ import (
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
+	"6.824/labgob"
+	"bytes"
 	"context"
 	"errors"
 	log "github.com/sirupsen/logrus"
@@ -158,6 +160,12 @@ func (rf *Raft) becomeCandidate() {
 	term := atomic.LoadInt64(&rf.currentTerm)
 	atomic.StoreInt64(&rf.currentTerm, term+1)
 	atomic.StoreInt64(&rf.votedFor, (int64)(rf.me))
+	// log.Info(rf.me, " prepares to lock log mutex when becoming candiate")
+	rf.logMutex.Lock()
+	// log.Info(rf.me, " locks log mutex when becoming candiate")
+	rf.persist()
+	rf.logMutex.Unlock()
+	// log.Info(rf.me, " unlocks log mutex when becoming candiate")
 	log.WithFields(log.Fields{
 		"term": atomic.LoadInt64(&rf.currentTerm),
 	}).Info(rf.me, " became a candidate")
@@ -177,6 +185,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(atomic.LoadInt64(&rf.currentTerm))
+	e.Encode(atomic.LoadInt64(&rf.votedFor))
+	// rf.logMutex.Lock()
+	e.Encode(rf.log)
+	// rf.logMutex.Unlock()
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -199,6 +216,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int64
+	var votedFor int64
+	var logEntries []LogEntry
+	if d.Decode(&term) != nil || 
+	   d.Decode(&votedFor) != nil ||
+	   d.Decode(&logEntries) != nil {
+		panic("failed to read persistent states")
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.log = logEntries
+	}
 }
 
 //
@@ -280,6 +311,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// When candidate's term is greater than mine, set my term equal to it
 	if args.Term > prevTerm {
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
+		// log.WithFields(log.Fields{
+			// "term": prevTerm,
+		// }).Info(rf.me, " prepares to lock log mutex")
+		rf.logMutex.Lock()
+		// log.WithFields(log.Fields{
+			// "term": prevTerm,
+		// }).Info(rf.me, " after log mutex locked")
+		rf.persist()
+		rf.logMutex.Unlock()
+		// log.WithFields(log.Fields{
+			// "term": prevTerm,
+		// }).Info(rf.me, " after log mutex unlocked")
 
 
 		// If I don't become follower then everyone will just vote for itself and nobody can get elected.
@@ -290,7 +333,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		// When increasing term, reset votedFor to null
 		if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Leader) {
+			rf.logMutex.Lock()
 			rf.becomeFollower()
+			rf.persist()
+			rf.logMutex.Unlock()
 		} //else {
 			// reply.VoteGranted = false
 			// return
@@ -321,6 +367,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			}
 			reply.VoteGranted = true
 			atomic.StoreInt64(&rf.votedFor, args.CandidateId)
+			rf.persist()
 
 			rf.cancelElectionOrNoNeed()
 			log.WithFields(log.Fields{
@@ -413,9 +460,21 @@ func (rf *Raft) collectVotes() (err error) {
 		case reply = <-cv:
 			// rf.termMutex.Lock()
 			if reply.Term > term {
-				rf.becomeFollower()
 				rf.cancelElectionOrNoNeed()
 				atomic.StoreInt64(&rf.currentTerm, reply.Term)
+				// log.WithFields(log.Fields{
+					// "term": term,
+				// }).Info(rf.me, " prepares to lock log mutex when updating term")
+				rf.logMutex.Lock()
+				// log.WithFields(log.Fields{
+					// "term": term,
+				// }).Info(rf.me, " locks log mutex when updating term")
+				rf.becomeFollower()
+				rf.persist()
+				rf.logMutex.Unlock()
+				// log.WithFields(log.Fields{
+					// "term": term,
+				// }).Info(rf.me, " unlocks log mutex when updating term")
 				return errors.New("larger term")
 			}
 			// rf.termMutex.Unlock()
@@ -474,6 +533,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	} else {
 		atomic.StoreInt64(&rf.currentTerm, args.Term)
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " prepares to lock log mutex when updating term")
+		rf.logMutex.Lock()
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " locks log mutex when updating term")
+		rf.persist()
+		rf.logMutex.Unlock()
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " unlocks log mutex when updating term")
 	}
 
 
@@ -485,8 +556,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	prevCommitIndex := atomic.LoadInt64(&rf.commitIndex)
 	// if two leaders met
 	if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Follower) && atomic.LoadInt64(&rf.commitIndex) <= args.LeaderCommit {
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " prepares to lock log mutex when updating votedfor")
+		rf.logMutex.Lock()
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " locks log mutex when updating votedfor")
 		rf.becomeFollower()
 		atomic.StoreInt64(&rf.votedFor, args.LeaderId)
+		rf.persist()
+		rf.logMutex.Unlock()
+		// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// }).Info(rf.me, " unlocks log mutex when updating votedfor")
 	}
 
 	if args.LeaderId == atomic.LoadInt64(&rf.votedFor) {
@@ -549,6 +632,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if appendStartIndex >= 0 {
 		rf.log = append(rf.log, args.Entries[appendStartIndex:]...)
+		rf.persist()
 	}
 
 	if args.LeaderCommit > prevCommitIndex {
@@ -597,6 +681,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		rf.logMutex.Lock()
 		rf.log = append(rf.log, LogEntry{Command: command, Term: atomic.LoadInt64(&rf.currentTerm)})
+		rf.persist()
 		index = len(rf.log) - 1
 		rf.logMutex.Unlock()
 	}
@@ -720,7 +805,10 @@ func (rf *Raft) talkPeriodically() {
 				if ok {
 					if reply.Term > term {
 						atomic.StoreInt64(&rf.currentTerm, reply.Term)
+						rf.logMutex.Lock()
 						rf.becomeFollower()
+						rf.persist()
+						rf.logMutex.Unlock()
 						return
 					}
 					rf.followerIndexMutex.Lock()
