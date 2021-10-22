@@ -75,8 +75,9 @@ const (
 )
 
 const (
-	CollectVotesTimeout time.Duration = 1000 * time.Millisecond //1s
+	CollectVotesTimeout time.Duration = 500 * time.Millisecond //1s
 	ElectionTimerBase time.Duration = 200 * time.Millisecond
+	RPCTimeout time.Duration = CollectVotesTimeout
 )
 
 type Raft struct {
@@ -362,6 +363,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.logMutex.Lock()
 		defer rf.logMutex.Unlock()
 		if (args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex + 1 >= len(rf.log)) || (args.LastLogTerm > rf.log[len(rf.log)-1].Term) {
+			log.WithFields(log.Fields{
+				"term": prevTerm,
+			}).Info(rf.me, " the candidate has lastLogTerm: ", args.LastLogTerm)
+
 			if args.CandidateId != rf.me {
 				rf.becomeFollower()
 			}
@@ -425,6 +430,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) collectVotes() (err error) {
 	cv := make(chan RequestVoteReply)
+	stopCh := make(chan struct{})
 	var term int64 = atomic.LoadInt64(&rf.currentTerm)
 	rf.logMutex.Lock()
 	lastLogTerm := rf.log[len(rf.log)-1].Term
@@ -432,6 +438,9 @@ func (rf *Raft) collectVotes() (err error) {
 	// "term": term,
 	// }).Info(rf.me, " tried to lock log")
 	args := RequestVoteArgs{Term: term, CandidateId: rf.me, LastLogIndex: len(rf.log) - 1, LastLogTerm: lastLogTerm, CommitIndex: atomic.LoadInt64(&rf.commitIndex)}
+	log.WithFields(log.Fields{
+	"term": term,
+	}).Info(rf.me, " tried to win election with log: ", rf.log)
 	rf.logMutex.Unlock()
 	// log.WithFields(log.Fields{
 	// "term": term,
@@ -444,8 +453,12 @@ func (rf *Raft) collectVotes() (err error) {
 			var reply RequestVoteReply
 			ok := rf.sendRequestVote(i, &args, &reply)
 			if ok {
-				cv <- reply
+				select {
+				case cv <- reply:
+				case <- stopCh:
+				}
 			}
+			// log.Info(i, " requestvote goroutine finished")
 		}(i)
 	}
 	log.WithFields(log.Fields{
@@ -455,6 +468,7 @@ func (rf *Raft) collectVotes() (err error) {
 	var votesCount int
 	ctx, cancel := context.WithTimeout(context.Background(), CollectVotesTimeout)
 	defer cancel()
+	defer close(stopCh)
 	for {
 		select {
 		case reply = <-cv:
@@ -684,6 +698,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		index = len(rf.log) - 1
 		rf.logMutex.Unlock()
+		log.WithFields(log.Fields{
+			"term": atomic.LoadInt64(&rf.currentTerm),
+		}).Info(rf.me, " appends ", command, " with index ", index, " as leader")
 	}
 
 	// Your code here (2B).
@@ -809,21 +826,22 @@ func (rf *Raft) talkPeriodically() {
 						rf.becomeFollower()
 						rf.persist()
 						rf.logMutex.Unlock()
-						return
-					}
-					rf.followerIndexMutex.Lock()
-					if reply.Success {
-						// log.Info(args)
-						atomic.StoreInt64(&rf.nextIndex[i], logLength)
-						atomic.StoreInt64(&rf.matchIndex[i], logLength - 1)
-						// break
 					} else {
-						if reply.NeedPrevLog && reply.NeedLogIndex > 0 {
-							atomic.StoreInt64(&rf.nextIndex[i], reply.NeedLogIndex)
+						rf.followerIndexMutex.Lock()
+						if reply.Success {
+							// log.Info(args)
+							atomic.StoreInt64(&rf.nextIndex[i], logLength)
+							atomic.StoreInt64(&rf.matchIndex[i], logLength - 1)
+							// break
+						} else {
+							if reply.NeedPrevLog && reply.NeedLogIndex > 0 {
+								atomic.StoreInt64(&rf.nextIndex[i], reply.NeedLogIndex)
+							}
 						}
+						rf.followerIndexMutex.Unlock()
 					}
-					rf.followerIndexMutex.Unlock()
 				}
+				// log.Info(i, " appendentries goroutine finished")
 			}(i, logLength, leaderCommit)
 		}
 		prevCommitIndex := atomic.LoadInt64(&rf.commitIndex)
@@ -839,14 +857,16 @@ func (rf *Raft) talkPeriodically() {
 			if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Leader) {
 				return
 			}
-			if countMatch*2 > len(rf.peers) {
-				atomic.StoreInt64(&rf.commitIndex, i)
-				// rf.logMutex.Lock()
-				rf.sendApplyMsg((int)(prevCommitIndex) + 1, (int)(i) + 1)
-				// rf.logMutex.Unlock()
-				log.WithFields(log.Fields{
-					"term": atomic.LoadInt64(&rf.currentTerm),
-				}).Info(rf.me, " commits up to ", i, " as the leader")
+			if countMatch * 2 > len(rf.peers) {
+				rf.logMutex.Lock()
+				if atomic.LoadInt64(&rf.currentTerm) == rf.log[i].Term {
+					atomic.StoreInt64(&rf.commitIndex, i)
+					rf.sendApplyMsg((int)(prevCommitIndex) + 1, (int)(i) + 1)
+					log.WithFields(log.Fields{
+						"term": atomic.LoadInt64(&rf.currentTerm),
+					}).Info(rf.me, " commits up to ", i, " as the leader")
+				}
+				rf.logMutex.Unlock()
 				break
 			}
 		}
@@ -856,7 +876,10 @@ func (rf *Raft) talkPeriodically() {
 
 func (rf *Raft) sendApplyMsg(start int, end int) {
 	for i := start; i < end; i++ {
-		rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+		// rf.logMutex.Lock()
+		command := rf.log[i].Command
+		// rf.logMutex.Unlock()
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: command, CommandIndex: i}
 	}
 }
 
