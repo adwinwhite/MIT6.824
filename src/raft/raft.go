@@ -75,8 +75,9 @@ const (
 )
 
 const (
-	CollectVotesTimeout time.Duration = 500 * time.Millisecond //1s
+	CollectVotesTimeout time.Duration = 300 * time.Millisecond //1s
 	ElectionTimerBase   time.Duration = 200 * time.Millisecond
+	ElectionTimerRandom time.Duration = 400 * time.Millisecond
 	RPCTimeout          time.Duration = CollectVotesTimeout
 )
 
@@ -205,9 +206,9 @@ func (rf *Raft) persist() {
 	// rf.logMutex.Unlock()
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	log.WithFields(log.Fields{
-		"term": atomic.LoadInt64(&rf.currentTerm),
-	}).Info(rf.me, " persists successfully")
+	// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+	// }).Info(rf.me, " persists successfully")
 
 }
 
@@ -372,12 +373,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// log.WithFields(log.Fields{
 		// "term": prevTerm,
 		// }).Info(rf.me, " prepares to lock log mutex")
-		rf.logMutex.RLock()
+		// rf.logMutex.RLock()
 		// log.WithFields(log.Fields{
 		// "term": prevTerm,
 		// }).Info(rf.me, " after log mutex locked")
-		rf.persist()
-		rf.logMutex.RUnlock()
+		rf.becomeFollower()
+		// rf.persist()
+		// rf.logMutex.RUnlock()
 		// log.WithFields(log.Fields{
 		// "term": prevTerm,
 		// }).Info(rf.me, " after log mutex unlocked")
@@ -389,19 +391,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// }
 
 		// When increasing term, reset votedFor to null
-		if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Leader) {
-			rf.logMutex.RLock()
-			rf.becomeFollower()
-			rf.persist()
-			rf.logMutex.RUnlock()
-		} 
+		// if atomic.LoadInt32((*int32)(&rf.role)) != (int32)(Leader) {
+			// rf.logMutex.RLock()
+			// rf.becomeFollower()
+			// rf.persist()
+			// rf.logMutex.RUnlock()
+		// }
 	}
 
 
+	rf.logMutex.RLock()
+	defer rf.logMutex.RUnlock()
 	whoIVotedFor := atomic.LoadInt64(&rf.votedFor)
 	if whoIVotedFor == -1 || whoIVotedFor == args.CandidateId {
-		rf.logMutex.RLock()
-		defer rf.logMutex.RUnlock()
 		if (args.LastLogTerm == rf.lastTerm() && args.LastLogIndex+1 >= (int64)(len(rf.log))+rf.logFirstIndex) || (args.LastLogTerm > rf.lastTerm()) {
 			log.WithFields(log.Fields{
 				"term": prevTerm,
@@ -431,6 +433,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}).Info(rf.me, " refused to vote for ", args.CandidateId, " due to having voted for ", whoIVotedFor)
 	}
 	reply.VoteGranted = false
+	if args.Term > prevTerm {
+		rf.persist()
+	}
 	return
 }
 
@@ -573,11 +578,11 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	log.WithFields(log.Fields{
-		"term":        atomic.LoadInt64(&rf.currentTerm),
-		"commitIndex": atomic.LoadInt64(&rf.commitIndex),
-	}).Info(rf.me, " receives append entries from ", args.LeaderId)
-	log.Info(rf.me, args)
+	// log.WithFields(log.Fields{
+		// "term":        atomic.LoadInt64(&rf.currentTerm),
+		// "commitIndex": atomic.LoadInt64(&rf.commitIndex),
+	// }).Info(rf.me, " receives append entries from ", args.LeaderId)
+	// log.Info(rf.me, args)
 
 	reply.Term = atomic.LoadInt64(&rf.currentTerm)
 	reply.Success = true
@@ -658,14 +663,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex - rf.logFirstIndex >= 0 {
 		myPrevLogTerm = rf.log[args.PrevLogIndex-rf.logFirstIndex].Term
 	}
-	log.WithFields(log.Fields{
-		"term": atomic.LoadInt64(&rf.currentTerm),
-		"lastIncludedTerm": rf.lastIncludedTerm,
-		"arg.PrevLogIndex": args.PrevLogIndex,
-		"logFirstIndex": rf.logFirstIndex,
-		"args.prevLogTerm": args.PrevLogTerm,
-		"myPrevLogTerm": myPrevLogTerm,
-	}).Info(rf.me)
+	// log.WithFields(log.Fields{
+		// "term": atomic.LoadInt64(&rf.currentTerm),
+		// "lastIncludedTerm": rf.lastIncludedTerm,
+		// "arg.PrevLogIndex": args.PrevLogIndex,
+		// "logFirstIndex": rf.logFirstIndex,
+		// "args.prevLogTerm": args.PrevLogTerm,
+		// "myPrevLogTerm": myPrevLogTerm,
+	// }).Info(rf.me)
 	if myPrevLogTerm != args.PrevLogTerm {
 		log.WithFields(log.Fields{
 			"term": atomic.LoadInt64(&rf.currentTerm),
@@ -869,7 +874,7 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		sleeptime := 100 + rand.Int63n(500)
+		sleeptime := ElectionTimerBase + (time.Duration)(rand.Int63n(ElectionTimerRandom.Milliseconds())) * time.Millisecond
 		// log.WithFields(log.Fields{
 		// "term": atomic.LoadInt64(&rf.currentTerm),
 		// }).Info(rf.me, " will start election in ", sleeptime, " milliseconds")
@@ -878,7 +883,7 @@ func (rf *Raft) ticker() {
 		rf.cancelElection = cancel
 		rf.cancelMutex.Unlock()
 		select {
-		case <-time.After((time.Duration)(sleeptime) * time.Millisecond):
+		case <-time.After(sleeptime):
 			// if atomic.LoadInt32((*int32)(&rf.role)) == (int32)(Follower) {
 			rf.becomeCandidate()
 			// }
@@ -930,12 +935,12 @@ func (rf *Raft) talkPeriodically() {
 				// log.WithFields(log.Fields{
 				// "term": atomic.LoadInt64(&rf.currentTerm),
 				// }).Info(rf.me, " locks log mutex when sending installsnapshot or appendentries")
-				log.WithFields(log.Fields{
-				"term": atomic.LoadInt64(&rf.currentTerm),
-				"logLength": logLength,
-				"nextIndex": nextIndex,
-				"leader.logFirstIndex": rf.logFirstIndex,
-				}).Info(rf.me, " is a leader")
+				// log.WithFields(log.Fields{
+				// "term": atomic.LoadInt64(&rf.currentTerm),
+				// "logLength": logLength,
+				// "nextIndex": nextIndex,
+				// "leader.logFirstIndex": rf.logFirstIndex,
+				// }).Info(rf.me, " is a leader")
 				if nextIndex < rf.logFirstIndex {
 					var args InstallSnapshotArgs
 					var reply InstallSnapshotReply
@@ -945,19 +950,18 @@ func (rf *Raft) talkPeriodically() {
 					// "term": atomic.LoadInt64(&rf.currentTerm),
 					// }).Info(rf.me, " unlocks log mutex when sending installsnapshot")
 					ok := rf.sendInstallSnapshot(i, &args, &reply)
+					rf.logMutex.RLock()
 					if ok {
 						if reply.Term > term {
 							atomic.StoreInt64(&rf.currentTerm, reply.Term)
 							// log.WithFields(log.Fields{
 							// "term": atomic.LoadInt64(&rf.currentTerm),
 							// }).Info(rf.me, " prepares to lock log mutex when processing installsnapshot reply")
-							rf.logMutex.RLock()
 							// log.WithFields(log.Fields{
 							// "term": atomic.LoadInt64(&rf.currentTerm),
 							// }).Info(rf.me, " locks log mutex when processing installsnapshot reply")
 							rf.becomeFollower()
 							rf.persist()
-							rf.logMutex.RUnlock()
 							// log.WithFields(log.Fields{
 							// "term": atomic.LoadInt64(&rf.currentTerm),
 							// }).Info(rf.me, " unlocks log mutex when processing installsnapshot reply")
@@ -972,6 +976,7 @@ func (rf *Raft) talkPeriodically() {
 							rf.followerIndexMutex.Unlock()
 						}
 					}
+					rf.logMutex.RUnlock()
 				} else {
 					var args AppendEntriesArgs
 					var reply AppendEntriesReply
