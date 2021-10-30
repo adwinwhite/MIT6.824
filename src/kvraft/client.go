@@ -7,6 +7,7 @@ import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
+	prevLeaderId int
 	// You will have to modify this struct.
 }
 
@@ -20,6 +21,7 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.prevLeaderId = 0
 	// You'll have to add code here.
 	return ck
 }
@@ -37,6 +39,38 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	args := GetArgs{Key: key}
+	var reply GetReply
+
+	// assume previous leader is still in position
+	ok := ck.servers[ck.prevLeaderId].Call("KVServer.Get", &args, &reply)
+	if ok {
+		switch reply.Err {
+		case OK:
+			return reply.Value
+		case ErrNoKey:
+			return ""
+		case ErrWrongLeader:
+		}
+	}
+	for i, v := range ck.servers {
+		if i == ck.prevLeaderId {
+			continue
+		}
+		ok := v.Call("KVServer.Get", &args, &reply)
+		if ok {
+			switch reply.Err {
+			case OK:
+				ck.prevLeaderId = i
+				return reply.Value
+			case ErrNoKey:
+				ck.prevLeaderId = i
+				return ""
+			case ErrWrongLeader:
+			}
+		}
+	}
+
 
 	// You will have to modify this function.
 	return ""
@@ -54,6 +88,31 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	var reply PutAppendReply
+	ok := ck.servers[ck.prevLeaderId].Call("KVServer.PutAppend", &args, &reply)
+	if ok && reply.Err == OK {
+		return 
+	}
+
+	initialSkip := true
+	for {
+		for i, v := range ck.servers {
+			if initialSkip && i == ck.prevLeaderId {
+				initialSkip = false
+				continue
+			}
+			ok := v.Call("KVServer.PutAppend", &args, &reply)
+			if ok {
+				switch reply.Err {
+				case OK:
+					ck.prevLeaderId = i
+					return
+				case ErrWrongLeader:
+				}
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

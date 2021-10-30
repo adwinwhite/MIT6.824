@@ -841,7 +841,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logMutex.Unlock()
 		log.WithFields(log.Fields{
 			"term": atomic.LoadInt64(&rf.currentTerm),
-		}).Info(rf.me, " appends ", command, " with index ", index, " as leader")
+		}).Info(rf.me, " appends ", string(command.([]byte)), " with index ", index, " as leader")
 	}
 
 	// Your code here (2B).
@@ -1104,7 +1104,9 @@ func (rf *Raft) talkPeriodically() {
 
 func (rf *Raft) sendApplyMsg(start int, msgs []LogEntry) {
 	for i, v := range msgs {
+		// log.Info("raft: I'm sending msg to applyCh")
 		rf.applyCh <- ApplyMsg{CommandValid: true, Command: v.Command, CommandIndex: i + start}
+		// log.Info("raft: sent one")
 		// log.WithFields(log.Fields{
 		// "term": atomic.LoadInt64(&rf.currentTerm),
 		// }).Info(rf.me, " sent msg ", v.Command, " of index ", i + start, " to apply channel ")
