@@ -10,9 +10,16 @@ import (
 	// "bytes"
 	"fmt"
 	"encoding/json"
+	"context"
+	"time"
+	"strconv"
 )
 
 const Debug = false
+
+const (
+	ServiceRPCTimeout = 5 * time.Second
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -51,10 +58,15 @@ type KVServer struct {
 	applyListeners []BroadcastChan
 	applyListenersMutex sync.RWMutex
 	data    map[string]string
+	dataMutex sync.RWMutex
+
+	serialNos map[string]int64
 }
 
 func (kv *KVServer) get(key string) (value string, err Err) {
+	kv.dataMutex.RLock()
 	value, ok := kv.data[key]
+	kv.dataMutex.RUnlock()
 	if ok {
 		err = OK
 	} else {
@@ -69,6 +81,8 @@ func (kv *KVServer) putAppend(key string, value string, op string) {
 		"value": value,
 		"op": op,
 	}).Info(kv.me, " putAppend")
+	kv.dataMutex.Lock()
+	defer kv.dataMutex.Unlock()
 	switch op {
 	case "Put":
 		kv.data[key] = value
@@ -80,6 +94,12 @@ func (kv *KVServer) putAppend(key string, value string, op string) {
 			kv.data[key] = value
 		}
 	}
+	val, _ := kv.data[key]
+	log.WithFields(log.Fields{
+		"key": key,
+		"value": value,
+		"op": op,
+	}).Info(kv.me, " putAppend ", key, ": ", val)
 }
 
 
@@ -107,17 +127,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	var ls BroadcastChan
 	ls.indexCh = make(chan int64)
 	ls.exitCh = make(chan struct{})
+	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
 	log.Info(kv.me, " append a listener for Get")
 	kv.applyListenersMutex.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
+	defer cancel()
 	for {
-		log.Info(kv.me, " before receiving index from Ch")
-		receivedIndex := <- ls.indexCh
-		log.Info("I received index ", receivedIndex)
-		if receivedIndex >= (int64)(index) {
-			reply.Value, reply.Err = kv.get(args.Key)
-			close(ls.exitCh)
+		select {
+		case receivedIndex := <- ls.indexCh:
+			if receivedIndex >= (int64)(index) {
+				reply.Value, reply.Err = kv.get(args.Key)
+				return
+			}
+		case <-ctx.Done():
+			reply.Err = ErrTimeout
 			return
 		}
 	}
@@ -144,24 +169,35 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// data := w.Bytes()
 	data, _ := json.Marshal(args)
 
-	index, _, isLeader := kv.rf.Start(data)
+	index, term, isLeader := kv.rf.Start(data)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	log.WithFields(log.Fields{
+		"index": index,
+		"term": term,
+	}).
+	Info(kv.me, " PutAppend: start returns")
 	var ls BroadcastChan
 	ls.indexCh = make(chan int64)
 	ls.exitCh = make(chan struct{})
+	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
 	log.Info(kv.me, " append a listener for PutAppend")
 	kv.applyListenersMutex.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
+	defer cancel()
 	for {
-		log.Info(kv.me, " before receiving index from Ch")
-		receivedIndex := <- ls.indexCh
-		log.Info(kv.me, " I received index ", receivedIndex)
-		if receivedIndex >= (int64)(index) {
-			close(ls.exitCh)
+		select {
+		case receivedIndex := <- ls.indexCh:
+			if receivedIndex >= (int64)(index) {
+				return
+			}
+		case <-ctx.Done():
+			reply.Err = ErrTimeout
+			log.Info(kv.me, " PutAppend timeouts")
 			return
 		}
 	}
@@ -194,12 +230,38 @@ func (kv *KVServer) applier() {
 		if err := json.Unmarshal(msg.Command.([]byte), &args); err != nil {
 			panic("failed to decode msg operation type")
 		}
-		log.Info(kv.me, args)
+		clerkId, ok := args["ClerkId"]
+		if !ok {
+			panic("failed to access clerk id")
+		}
 
-		_, ok := args["Value"]
+		_, ok = kv.serialNos[clerkId]
+		if !ok {
+			kv.serialNos[clerkId] = 0
+		}
+
+
+		log.WithFields(log.Fields{
+			"clerkId": clerkId,
+			"serialNo": kv.serialNos[clerkId],
+		}).Info(kv.me, args)
+
+		serialStr, ok := args["SerialNo"]
 		if ok {
-			kv.putAppend(args["Key"], args["Value"], args["Op"])
-		} 
+			serialNo, err := strconv.Atoi(serialStr)
+			if err != nil {
+				panic("failed to convert serial string to number")
+			}
+			if (int64)(serialNo) > kv.serialNos[clerkId] {
+				_, ok := args["Value"]
+				if ok {
+					kv.putAppend(args["Key"], args["Value"], args["Op"])
+					log.Info(kv.me, args, " applied")
+				} 
+				// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
+				kv.serialNos[clerkId] = (int64)(serialNo)
+			}
+		}
 
 
 
@@ -244,8 +306,8 @@ func (kv *KVServer) applier() {
 		kv.applyListenersMutex.Lock()
 		log.Info(kv.me, " I have ", len(kv.applyListeners), " listeners")
 		log.Info(waitToRemove)
-		for _, v := range waitToRemove {
-			kv.applyListeners = removeBroadcastCh(kv.applyListeners, v)
+		for i := len(waitToRemove) - 1; i >= 0; i-- {
+			kv.applyListeners = removeBroadcastCh(kv.applyListeners, waitToRemove[i])
 		}
 		// log.Info(kv.me, " I have ", len(kv.applyListeners), " listeners now")
 		kv.applyListenersMutex.Unlock()
@@ -281,6 +343,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.data = make(map[string]string)
+	kv.serialNos = make(map[string]int64)
 
 	// You may need initialization code here.
 	go kv.applier()

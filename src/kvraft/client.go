@@ -3,12 +3,20 @@ package kvraft
 import "6.824/labrpc"
 import "crypto/rand"
 import "math/big"
+import log "github.com/sirupsen/logrus"
+import "sync/atomic"
+import "strconv"
+import "time"
+import "sync"
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	prevLeaderId int
 	// You will have to modify this struct.
+	serialNo     int64
+	uid          string 
+	mu           sync.Mutex
 }
 
 func nrand() int64 {
@@ -22,6 +30,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.prevLeaderId = 0
+	ck.serialNo = 0
+	ck.uid = strconv.Itoa((int)(time.Now().UnixNano()))
 	// You'll have to add code here.
 	return ck
 }
@@ -38,8 +48,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 //
+
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{Key: key}
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := GetArgs{Key: key, SerialNo: strconv.Itoa((int)(atomic.AddInt64(&ck.serialNo, 1))), ClerkId: ck.uid}
 	var reply GetReply
 
 	// assume previous leader is still in position
@@ -51,29 +64,34 @@ func (ck *Clerk) Get(key string) string {
 		case ErrNoKey:
 			return ""
 		case ErrWrongLeader:
+		case ErrTimeout:
 		}
 	}
-	for i, v := range ck.servers {
-		if i == ck.prevLeaderId {
-			continue
-		}
-		ok := v.Call("KVServer.Get", &args, &reply)
-		if ok {
-			switch reply.Err {
-			case OK:
-				ck.prevLeaderId = i
-				return reply.Value
-			case ErrNoKey:
-				ck.prevLeaderId = i
-				return ""
-			case ErrWrongLeader:
+	initialSkip := true
+	for {
+		for i, v := range ck.servers {
+			if initialSkip && i == ck.prevLeaderId {
+				initialSkip = false
+				continue
+			}
+			ok := v.Call("KVServer.Get", &args, &reply)
+			if ok {
+				switch reply.Err {
+				case OK:
+					ck.prevLeaderId = i
+					return reply.Value
+				case ErrNoKey:
+					ck.prevLeaderId = i
+					return ""
+				case ErrWrongLeader:
+				case ErrTimeout:
+				}
 			}
 		}
 	}
 
 
 	// You will have to modify this function.
-	return ""
 }
 
 //
@@ -88,11 +106,20 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := PutAppendArgs{Key: key, Value: value, Op: op, SerialNo: strconv.Itoa((int)(atomic.AddInt64(&ck.serialNo, 1))), ClerkId: ck.uid}
+	log.Info("Clerk putappends: ", args)
 	var reply PutAppendReply
 	ok := ck.servers[ck.prevLeaderId].Call("KVServer.PutAppend", &args, &reply)
-	if ok && reply.Err == OK {
-		return 
+	if ok {
+		switch reply.Err {
+		case OK:
+			return
+		case ErrTimeout:
+		}
+	} else {
+		log.Info(ck.prevLeaderId, " rpc call is not ok")
 	}
 
 	initialSkip := true
@@ -109,7 +136,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					ck.prevLeaderId = i
 					return
 				case ErrWrongLeader:
+				case ErrTimeout:
 				}
+			} else {
+				log.Info(i, " rpc call is not ok")
 			}
 		}
 	}
