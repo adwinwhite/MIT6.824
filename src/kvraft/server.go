@@ -10,7 +10,7 @@ import (
 	// "bytes"
 	"fmt"
 	"encoding/json"
-	"context"
+	// "context"
 	"time"
 	"strconv"
 )
@@ -35,8 +35,15 @@ type Op struct {
 	// otherwise RPC will break.
 }
 
+// I wish there is tuple
+type IndexAndTerm struct {
+	index int64
+	term int64
+}
+
+
 type BroadcastChan struct {
-	indexCh chan int64
+	indexCh chan IndexAndTerm
 	exitCh chan struct{}
 }
 
@@ -119,33 +126,45 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// e.Encode(args.Key)
 	// data := w.Bytes()
 	data, _ := json.Marshal(args)
-	index, _, isLeader := kv.rf.Start(data)
+	index, term, isLeader := kv.rf.Start(data)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 	var ls BroadcastChan
-	ls.indexCh = make(chan int64)
+	ls.indexCh = make(chan IndexAndTerm)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
 	log.Info(kv.me, " append a listener for Get")
 	kv.applyListenersMutex.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
-	defer cancel()
-	for {
-		select {
-		case receivedIndex := <- ls.indexCh:
-			if receivedIndex >= (int64)(index) {
-				reply.Value, reply.Err = kv.get(args.Key)
-				return
-			}
-		case <-ctx.Done():
-			reply.Err = ErrTimeout
+	indexWithTerm := <- ls.indexCh
+	if indexWithTerm.term != (int64)(term) {
+		reply.Err = ErrWrongLeader
+		return
+	} else {
+		if indexWithTerm.index >= (int64)(index) {
+			reply.Value, reply.Err = kv.get(args.Key)
 			return
 		}
 	}
+
+	// ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
+	// defer cancel()
+	// for {
+		// select {
+		// case indexWithTerm := <- ls.indexCh:
+			// if indexWithTerm.term > term
+			// if receivedIndex >= (int64)(index) {
+				// reply.Value, reply.Err = kv.get(args.Key)
+				// return
+			// }
+		// case <-ctx.Done():
+			// reply.Err = ErrTimeout
+			// return
+		// }
+	// }
 }
 
 
@@ -180,27 +199,36 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}).
 	Info(kv.me, " PutAppend: start returns")
 	var ls BroadcastChan
-	ls.indexCh = make(chan int64)
+	ls.indexCh = make(chan IndexAndTerm)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
 	log.Info(kv.me, " append a listener for PutAppend")
 	kv.applyListenersMutex.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
-	defer cancel()
-	for {
-		select {
-		case receivedIndex := <- ls.indexCh:
-			if receivedIndex >= (int64)(index) {
-				return
-			}
-		case <-ctx.Done():
-			reply.Err = ErrTimeout
-			log.Info(kv.me, " PutAppend timeouts")
+	indexWithTerm := <- ls.indexCh
+	if indexWithTerm.term != (int64)(term) {
+		reply.Err = ErrWrongLeader
+		return
+	} else {
+		if indexWithTerm.index >= (int64)(index) {
 			return
 		}
 	}
+	// ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
+	// defer cancel()
+	// for {
+		// select {
+		// case receivedIndex := <- ls.indexCh:
+			// if receivedIndex >= (int64)(index) {
+				// return
+			// }
+		// case <-ctx.Done():
+			// reply.Err = ErrTimeout
+			// log.Info(kv.me, " PutAppend timeouts")
+			// return
+		// }
+	// }
 }
 
 //
@@ -226,41 +254,56 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) applier() {
 	for msg := range kv.applyCh {
-		var args map[string]string
-		if err := json.Unmarshal(msg.Command.([]byte), &args); err != nil {
-			panic("failed to decode msg operation type")
-		}
-		clerkId, ok := args["ClerkId"]
-		if !ok {
-			panic("failed to access clerk id")
-		}
-
-		_, ok = kv.serialNos[clerkId]
-		if !ok {
-			kv.serialNos[clerkId] = 0
-		}
-
-
-		log.WithFields(log.Fields{
-			"clerkId": clerkId,
-			"serialNo": kv.serialNos[clerkId],
-		}).Info(kv.me, args)
-
-		serialStr, ok := args["SerialNo"]
+		c, ok := msg.Command.([]byte)
 		if ok {
-			serialNo, err := strconv.Atoi(serialStr)
-			if err != nil {
-				panic("failed to convert serial string to number")
-			}
-			if (int64)(serialNo) > kv.serialNos[clerkId] {
-				_, ok := args["Value"]
+			// Check whether command is no-op
+			if len(c) == 0 {
+				log.WithFields(log.Fields{
+					"index": msg.CommandIndex,
+					"term": msg.CommandTerm,
+				}).Info(kv.me, " received no-op")
+			} else {
+				var args map[string]string
+				if err := json.Unmarshal(c, &args); err != nil {
+					panic("failed to decode msg operation type")
+				}
+				clerkId, ok := args["ClerkId"]
+				if !ok {
+					panic("failed to access clerk id")
+				}
+
+				_, ok = kv.serialNos[clerkId]
+				if !ok {
+					kv.serialNos[clerkId] = 0
+				}
+
+
+				log.WithFields(log.Fields{
+					"clerkId": clerkId,
+					"serialNo": kv.serialNos[clerkId],
+					"index": msg.CommandIndex,
+					"term": msg.CommandTerm,
+				}).Info(kv.me, args)
+
+				serialStr, ok := args["SerialNo"]
 				if ok {
-					kv.putAppend(args["Key"], args["Value"], args["Op"])
-					log.Info(kv.me, args, " applied")
-				} 
-				// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
-				kv.serialNos[clerkId] = (int64)(serialNo)
+					serialNo, err := strconv.Atoi(serialStr)
+					if err != nil {
+						panic("failed to convert serial string to number")
+					}
+					if (int64)(serialNo) > kv.serialNos[clerkId] {
+						_, ok := args["Value"]
+						if ok {
+							kv.putAppend(args["Key"], args["Value"], args["Op"])
+							log.Info(kv.me, args, " applied")
+						} 
+						// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
+						kv.serialNos[clerkId] = (int64)(serialNo)
+					}
+				}
 			}
+		} else {
+			panic("Command is not no-op nor bytes")
 		}
 
 
@@ -295,7 +338,7 @@ func (kv *KVServer) applier() {
 		for i, v := range kv.applyListeners {
 			// log.Info(kv.me, " before notifying one listener about index update")
 			select {
-			case v.indexCh <- (int64)(msg.CommandIndex):
+			case v.indexCh <- IndexAndTerm{index: (int64)(msg.CommandIndex), term: msg.CommandTerm}:
 			case <- v.exitCh:
 				waitToRemove = append(waitToRemove, i)
 			}
