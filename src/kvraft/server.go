@@ -117,7 +117,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	log.Info(kv.me, " Get ", fmt.Sprintf("%+v", args))
 
 	// Submit operation
 	// w := new(bytes.Buffer)
@@ -137,17 +136,38 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
-	log.Info(kv.me, " append a listener for Get")
+	log.WithFields(log.Fields{
+		"index": index,
+		"term": term,
+	}).Info(kv.me, " Get ", fmt.Sprintf("%+v", args))
 	kv.applyListenersMutex.Unlock()
-	indexWithTerm := <- ls.indexCh
-	if indexWithTerm.term != (int64)(term) {
-		reply.Err = ErrWrongLeader
-		return
-	} else {
-		if indexWithTerm.index >= (int64)(index) {
-			reply.Value, reply.Err = kv.get(args.Key)
-			return
+	// Determine whether applyMsg matches command.
+	// Case 1: entry at index is what we submitted.
+	// Case 2: entry at index is not what we submitted due to the leader died or lost leadership before propagating this entry.
+	// Just check term of entry at index.
+	for {
+		indexWithTerm := <- ls.indexCh
+		// Is there a chance that indexWithTerm.index is greater than index?
+		if indexWithTerm.index == (int64)(index) {
+			if indexWithTerm.term == (int64)(term) {
+				reply.Value, reply.Err = kv.get(args.Key)
+				return
+			} else {
+				reply.Err = ErrWrongLeader
+				return
+			}
 		}
+
+
+		// if indexWithTerm.term != (int64)(term) {
+			// reply.Err = ErrWrongLeader
+			// return
+		// } else {
+			// if indexWithTerm.index >= (int64)(index) {
+				// reply.Value, reply.Err = kv.get(args.Key)
+				// return
+			// }
+		// }
 	}
 
 	// ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
@@ -206,14 +226,24 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.applyListeners = append(kv.applyListeners, ls)
 	log.Info(kv.me, " append a listener for PutAppend")
 	kv.applyListenersMutex.Unlock()
-	indexWithTerm := <- ls.indexCh
-	if indexWithTerm.term != (int64)(term) {
-		reply.Err = ErrWrongLeader
-		return
-	} else {
-		if indexWithTerm.index >= (int64)(index) {
-			return
+	for {
+		indexWithTerm := <- ls.indexCh
+		if indexWithTerm.index == (int64)(index) {
+			if indexWithTerm.term == (int64)(term) {
+				return
+			} else {
+				reply.Err = ErrWrongLeader
+				return
+			}
 		}
+		// if indexWithTerm.term != (int64)(term) {
+			// reply.Err = ErrWrongLeader
+			// return
+		// } else {
+			// if indexWithTerm.index >= (int64)(index) {
+				// return
+			// }
+		// }
 	}
 	// ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
 	// defer cancel()
@@ -295,10 +325,10 @@ func (kv *KVServer) applier() {
 						_, ok := args["Value"]
 						if ok {
 							kv.putAppend(args["Key"], args["Value"], args["Op"])
-							log.Info(kv.me, args, " applied")
 						} 
 						// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
 						kv.serialNos[clerkId] = (int64)(serialNo)
+						log.Info(kv.me, args, " applied")
 					}
 				}
 			}
@@ -347,8 +377,8 @@ func (kv *KVServer) applier() {
 		kv.applyListenersMutex.RUnlock()
 		// log.Info(kv.me, " runlocked listeners")
 		kv.applyListenersMutex.Lock()
-		log.Info(kv.me, " I have ", len(kv.applyListeners), " listeners")
-		log.Info(waitToRemove)
+		// log.Info(kv.me, " I have ", len(kv.applyListeners), " listeners")
+		// log.Info(waitToRemove)
 		for i := len(waitToRemove) - 1; i >= 0; i-- {
 			kv.applyListeners = removeBroadcastCh(kv.applyListeners, waitToRemove[i])
 		}
