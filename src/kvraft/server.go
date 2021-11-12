@@ -13,6 +13,7 @@ import (
 	// "context"
 	"time"
 	"strconv"
+	"bytes"
 )
 
 const Debug = false
@@ -56,6 +57,7 @@ type KVServer struct {
 	mu      sync.Mutex
 	me      int
 	rf      *raft.Raft
+	persister *raft.Persister
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
@@ -145,6 +147,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Case 1: entry at index is what we submitted.
 	// Case 2: entry at index is not what we submitted due to the leader died or lost leadership before propagating this entry.
 	// Just check term of entry at index.
+	// What if it's a snapshot? Leader only sends snapshot at restart. Index of snapshot is guaranteed to be smaller than what we need.
 	for {
 		indexWithTerm := <- ls.indexCh
 		// Is there a chance that indexWithTerm.index is greater than index?
@@ -157,34 +160,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				return
 			}
 		}
-
-
-		// if indexWithTerm.term != (int64)(term) {
-			// reply.Err = ErrWrongLeader
-			// return
-		// } else {
-			// if indexWithTerm.index >= (int64)(index) {
-				// reply.Value, reply.Err = kv.get(args.Key)
-				// return
-			// }
-		// }
 	}
-
-	// ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
-	// defer cancel()
-	// for {
-		// select {
-		// case indexWithTerm := <- ls.indexCh:
-			// if indexWithTerm.term > term
-			// if receivedIndex >= (int64)(index) {
-				// reply.Value, reply.Err = kv.get(args.Key)
-				// return
-			// }
-		// case <-ctx.Done():
-			// reply.Err = ErrTimeout
-			// return
-		// }
-	// }
 }
 
 
@@ -236,29 +212,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				return
 			}
 		}
-		// if indexWithTerm.term != (int64)(term) {
-			// reply.Err = ErrWrongLeader
-			// return
-		// } else {
-			// if indexWithTerm.index >= (int64)(index) {
-				// return
-			// }
-		// }
 	}
-	// ctx, cancel := context.WithTimeout(context.Background(), ServiceRPCTimeout)
-	// defer cancel()
-	// for {
-		// select {
-		// case receivedIndex := <- ls.indexCh:
-			// if receivedIndex >= (int64)(index) {
-				// return
-			// }
-		// case <-ctx.Done():
-			// reply.Err = ErrTimeout
-			// log.Info(kv.me, " PutAppend timeouts")
-			// return
-		// }
-	// }
 }
 
 //
@@ -284,109 +238,125 @@ func (kv *KVServer) killed() bool {
 
 func (kv *KVServer) applier() {
 	for msg := range kv.applyCh {
-		c, ok := msg.Command.([]byte)
-		if ok {
-			// Check whether command is no-op
-			if len(c) == 0 {
-				log.WithFields(log.Fields{
-					"index": msg.CommandIndex,
-					"term": msg.CommandTerm,
-				}).Info(kv.me, " received no-op")
+		if msg.CommandValid {
+			c, ok := msg.Command.([]byte)
+			if ok {
+				// Check whether command is no-op
+				if len(c) == 0 {
+					log.WithFields(log.Fields{
+						"index": msg.CommandIndex,
+						"term": msg.CommandTerm,
+					}).Info(kv.me, " received no-op")
+				} else {
+					var args map[string]string
+					if err := json.Unmarshal(c, &args); err != nil {
+						panic("failed to decode msg operation type")
+					}
+					clerkId, ok := args["ClerkId"]
+					if !ok {
+						panic("failed to access clerk id")
+					}
+
+					_, ok = kv.serialNos[clerkId]
+					if !ok {
+						kv.serialNos[clerkId] = 0
+					}
+
+
+					log.WithFields(log.Fields{
+						"clerkId": clerkId,
+						"serialNo": kv.serialNos[clerkId],
+						"index": msg.CommandIndex,
+						"term": msg.CommandTerm,
+					}).Info(kv.me, args)
+
+					serialStr, ok := args["SerialNo"]
+					if ok {
+						serialNo, err := strconv.Atoi(serialStr)
+						if err != nil {
+							panic("failed to convert serial string to number")
+						}
+						if (int64)(serialNo) > kv.serialNos[clerkId] {
+							_, ok := args["Value"]
+							if ok {
+								kv.putAppend(args["Key"], args["Value"], args["Op"])
+							} 
+							// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
+							kv.serialNos[clerkId] = (int64)(serialNo)
+							log.Info(kv.me, args, " applied")
+						}
+					}
+				}
 			} else {
-				var args map[string]string
-				if err := json.Unmarshal(c, &args); err != nil {
-					panic("failed to decode msg operation type")
-				}
-				clerkId, ok := args["ClerkId"]
-				if !ok {
-					panic("failed to access clerk id")
-				}
-
-				_, ok = kv.serialNos[clerkId]
-				if !ok {
-					kv.serialNos[clerkId] = 0
-				}
-
-
-				log.WithFields(log.Fields{
-					"clerkId": clerkId,
-					"serialNo": kv.serialNos[clerkId],
-					"index": msg.CommandIndex,
-					"term": msg.CommandTerm,
-				}).Info(kv.me, args)
-
-				serialStr, ok := args["SerialNo"]
-				if ok {
-					serialNo, err := strconv.Atoi(serialStr)
-					if err != nil {
-						panic("failed to convert serial string to number")
-					}
-					if (int64)(serialNo) > kv.serialNos[clerkId] {
-						_, ok := args["Value"]
-						if ok {
-							kv.putAppend(args["Key"], args["Value"], args["Op"])
-						} 
-						// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
-						kv.serialNos[clerkId] = (int64)(serialNo)
-						log.Info(kv.me, args, " applied")
-					}
-				}
+				panic("Command is not no-op nor bytes")
 			}
+
+			// Check raft persister size.
+			if kv.persister.RaftStateSize() > kv.maxraftstate {
+				snapshotData := kv.createSnapshot()
+				kv.rf.Snapshot(msg.CommandIndex, snapshotData)
+			}
+		} else if msg.SnapshotValid {
+			// Receive snapshot
+			kv.applySnapshot(msg.Snapshot)
 		} else {
-			panic("Command is not no-op nor bytes")
+			continue
 		}
 
-
-
-		// r := bytes.NewBuffer(msg.Command.([]byte))
-		// d := labgob.NewDecoder(r)
-		// var opea string
-		// if d.Decode(&opea) != nil {
-			// panic("failed to decode msg operation type")
-		// } else {
-			// log.Info(kv.me, " is applying operation ", opea)
-			// switch opea {
-			// case "Get":
-			// case "PutAppend":
-				// var key string
-				// var value string
-				// var op string
-				// if d.Decode(&key) != nil ||
-				// d.Decode(&value) != nil ||
-				// d.Decode(&op) != nil {
-					// panic("failed to decode msg args")
-				// } else {
-					// kv.putAppend(key, value, op)
-				// }
-			// }
-		// }
+		// Notify all listeners about index&term of msg
+		var indexToNotify IndexAndTerm
+		if msg.CommandValid {
+			indexToNotify.index = (int64)(msg.CommandIndex)
+			indexToNotify.term = msg.CommandTerm
+		} else if msg.SnapshotValid {
+			indexToNotify.index = (int64)(msg.SnapshotIndex)
+			indexToNotify.term = (int64)(msg.SnapshotTerm)
+		} 
 		waitToRemove := make([]int, 0, 1)
-		// log.Info(kv.me, " applier before rlock")
 		kv.applyListenersMutex.RLock()
-		// log.Info("I have ", len(kv.applyListeners), " listeners")
-		// log.Info(kv.me, " applier after rlock")
 		for i, v := range kv.applyListeners {
 			// log.Info(kv.me, " before notifying one listener about index update")
 			select {
-			case v.indexCh <- IndexAndTerm{index: (int64)(msg.CommandIndex), term: msg.CommandTerm}:
+			case v.indexCh <- indexToNotify:
 			case <- v.exitCh:
 				waitToRemove = append(waitToRemove, i)
 			}
 			// log.Info(kv.me, " notified one listener about index update")
 		}
 		kv.applyListenersMutex.RUnlock()
-		// log.Info(kv.me, " runlocked listeners")
 		kv.applyListenersMutex.Lock()
-		// log.Info(kv.me, " I have ", len(kv.applyListeners), " listeners")
-		// log.Info(waitToRemove)
 		for i := len(waitToRemove) - 1; i >= 0; i-- {
 			kv.applyListeners = removeBroadcastCh(kv.applyListeners, waitToRemove[i])
 		}
-		// log.Info(kv.me, " I have ", len(kv.applyListeners), " listeners now")
 		kv.applyListenersMutex.Unlock()
-		// log.Info(kv.me, " unlocked listeners")
 	}
 }
+
+
+func (kv *KVServer) createSnapshot() []byte {
+	kv.dataMutex.RLock()
+	defer kv.dataMutex.RUnlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) applySnapshot(snapshotData []byte) {
+	r := bytes.NewBuffer(snapshotData)
+	d := labgob.NewDecoder(r)
+	kv.dataMutex.Lock()
+	defer kv.dataMutex.Unlock()
+	newData := make(map[string]string)
+	if d.Decode(&newData) != nil {
+		panic("failed to decode kv data")
+	} else {
+		kv.data = newData
+	}
+}
+
+
 
 //
 // servers[] contains the ports of the set of
@@ -417,6 +387,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.data = make(map[string]string)
 	kv.serialNos = make(map[string]int64)
+	kv.persister = persister
 
 	// You may need initialization code here.
 	go kv.applier()
