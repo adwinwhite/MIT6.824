@@ -100,11 +100,11 @@ func (kv *KVServer) get(key string) (value string, err Err) {
 func (kv *KVServer) putAppend(key string, value string, op string) {
 	kv.snapshotMutex.RLock()
 	defer kv.snapshotMutex.RUnlock()
-	log.WithFields(log.Fields{
-		"key":   key,
-		"value": value,
-		"op":    op,
-	}).Info(kv.me, " putAppend")
+	// log.WithFields(log.Fields{
+		// "key":   key,
+		// "value": value,
+		// "op":    op,
+	// }).Info(kv.me, " putAppend")
 	hashedKey := kv.hashkey(key)
 	kv.dataMutex[hashedKey].Lock()
 	defer kv.dataMutex[hashedKey].Unlock()
