@@ -8,18 +8,20 @@ import (
 	"sync"
 	"sync/atomic"
 	// "bytes"
-	"fmt"
 	"encoding/json"
+	"fmt"
 	// "context"
-	"time"
-	"strconv"
 	"bytes"
+	"github.com/segmentio/fasthash/fnv1a"
+	"strconv"
+	"time"
 )
 
 const Debug = false
 
 const (
 	ServiceRPCTimeout = 5 * time.Second
+	NumOfDataBuckets  = 10
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -28,7 +30,6 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
-
 
 type Op struct {
 	// Your definitions here.
@@ -39,43 +40,55 @@ type Op struct {
 // I wish there is tuple
 type IndexAndTerm struct {
 	index int64
-	term int64
+	term  int64
 }
-
 
 type BroadcastChan struct {
 	indexCh chan IndexAndTerm
-	exitCh chan struct{}
+	exitCh  chan struct{}
 }
 
 func removeBroadcastCh(s []BroadcastChan, i int) []BroadcastChan {
-    s[i] = s[len(s)-1]
-    return s[:len(s)-1]
+	s[i] = s[len(s)-1]
+	return s[:len(s)-1]
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
 	persister *raft.Persister
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	applyCh   chan raft.ApplyMsg
+	dead      int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	applyListeners []BroadcastChan
+	applyListeners      []BroadcastChan
 	applyListenersMutex sync.RWMutex
-	data    map[string]string
-	dataMutex sync.RWMutex
+
+	data          []map[string]string
+	dataMutex     []sync.RWMutex
+	snapshotMutex sync.RWMutex
+	msgCh         []chan raft.ApplyMsg
 
 	serialNos map[string]int64
+
+	isSnapshoting      int32
+	snapshotStateMutex sync.Mutex
+}
+
+func (kv *KVServer) hashkey(key string) uint64 {
+	return fnv1a.HashString64(key) % NumOfDataBuckets
 }
 
 func (kv *KVServer) get(key string) (value string, err Err) {
-	kv.dataMutex.RLock()
-	value, ok := kv.data[key]
-	kv.dataMutex.RUnlock()
+	kv.snapshotMutex.RLock()
+	defer kv.snapshotMutex.RUnlock()
+	hashedKey := kv.hashkey(key)
+	kv.dataMutex[hashedKey].RLock()
+	defer kv.dataMutex[hashedKey].RUnlock()
+	value, ok := kv.data[hashedKey][key]
 	if ok {
 		err = OK
 	} else {
@@ -85,32 +98,34 @@ func (kv *KVServer) get(key string) (value string, err Err) {
 }
 
 func (kv *KVServer) putAppend(key string, value string, op string) {
+	kv.snapshotMutex.RLock()
+	defer kv.snapshotMutex.RUnlock()
 	log.WithFields(log.Fields{
-		"key": key,
+		"key":   key,
 		"value": value,
-		"op": op,
+		"op":    op,
 	}).Info(kv.me, " putAppend")
-	kv.dataMutex.Lock()
-	defer kv.dataMutex.Unlock()
+	hashedKey := kv.hashkey(key)
+	kv.dataMutex[hashedKey].Lock()
+	defer kv.dataMutex[hashedKey].Unlock()
 	switch op {
 	case "Put":
-		kv.data[key] = value
+		kv.data[hashedKey][key] = value
 	case "Append":
-		val, ok := kv.data[key]
+		val, ok := kv.data[hashedKey][key]
 		if ok {
-			kv.data[key] = val + value
+			kv.data[hashedKey][key] = val + value
 		} else {
-			kv.data[key] = value
+			kv.data[hashedKey][key] = value
 		}
 	}
-	val, _ := kv.data[key]
-	log.WithFields(log.Fields{
-		"key": key,
-		"value": value,
-		"op": op,
-	}).Info(kv.me, " putAppend ", key, ": ", val)
+	// val, _ := kv.data[hashedKey][key]
+	// log.WithFields(log.Fields{
+		// "key":   key,
+		// "value": value,
+		// "op":    op,
+	// }).Info(kv.me, " putAppend ", key, ": ", val)
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Check whether I am leader
@@ -140,7 +155,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.applyListeners = append(kv.applyListeners, ls)
 	log.WithFields(log.Fields{
 		"index": index,
-		"term": term,
+		"term":  term,
 	}).Info(kv.me, " Get ", fmt.Sprintf("%+v", args))
 	kv.applyListenersMutex.Unlock()
 	// Determine whether applyMsg matches command.
@@ -149,7 +164,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Just check term of entry at index.
 	// What if it's a snapshot? Leader only sends snapshot at restart. Index of snapshot is guaranteed to be smaller than what we need.
 	for {
-		indexWithTerm := <- ls.indexCh
+		indexWithTerm := <-ls.indexCh
 		// Is there a chance that indexWithTerm.index is greater than index?
 		if indexWithTerm.index == (int64)(index) {
 			if indexWithTerm.term == (int64)(term) {
@@ -163,7 +178,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 }
 
-
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Check whether I am leader
 	_, isLeader := kv.rf.GetState()
@@ -172,7 +186,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	reply.Err = OK
-	log.Info(kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
+	// log.Info(kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
 
 	// Submit operation
 	// w := new(bytes.Buffer)
@@ -191,19 +205,18 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	log.WithFields(log.Fields{
 		"index": index,
-		"term": term,
-	}).
-	Info(kv.me, " PutAppend: start returns")
+		"term":  term,
+	}).Info(kv.me, " PutAppend: start returns")
 	var ls BroadcastChan
 	ls.indexCh = make(chan IndexAndTerm)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
-	log.Info(kv.me, " append a listener for PutAppend")
+	// log.Info(kv.me, " append a listener for PutAppend")
 	kv.applyListenersMutex.Unlock()
 	for {
-		indexWithTerm := <- ls.indexCh
+		indexWithTerm := <-ls.indexCh
 		if indexWithTerm.index == (int64)(index) {
 			if indexWithTerm.term == (int64)(term) {
 				return
@@ -245,7 +258,7 @@ func (kv *KVServer) applier() {
 				if len(c) == 0 {
 					log.WithFields(log.Fields{
 						"index": msg.CommandIndex,
-						"term": msg.CommandTerm,
+						"term":  msg.CommandTerm,
 					}).Info(kv.me, " received no-op")
 				} else {
 					var args map[string]string
@@ -262,13 +275,12 @@ func (kv *KVServer) applier() {
 						kv.serialNos[clerkId] = 0
 					}
 
-
-					log.WithFields(log.Fields{
-						"clerkId": clerkId,
-						"serialNo": kv.serialNos[clerkId],
-						"index": msg.CommandIndex,
-						"term": msg.CommandTerm,
-					}).Info(kv.me, args)
+					// log.WithFields(log.Fields{
+						// "clerkId":  clerkId,
+						// "serialNo": kv.serialNos[clerkId],
+						// "index":    msg.CommandIndex,
+						// "term":     msg.CommandTerm,
+					// }).Info(kv.me, args)
 
 					serialStr, ok := args["SerialNo"]
 					if ok {
@@ -280,10 +292,10 @@ func (kv *KVServer) applier() {
 							_, ok := args["Value"]
 							if ok {
 								kv.putAppend(args["Key"], args["Value"], args["Op"])
-							} 
+							}
 							// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
 							kv.serialNos[clerkId] = (int64)(serialNo)
-							log.Info(kv.me, args, " applied")
+							// log.Info(kv.me, args, " applied")
 						}
 					}
 				}
@@ -291,10 +303,16 @@ func (kv *KVServer) applier() {
 				panic("Command is not no-op nor bytes")
 			}
 
-			// Check raft persister size.
-			if kv.persister.RaftStateSize() > kv.maxraftstate {
-				snapshotData := kv.createSnapshot()
-				kv.rf.Snapshot(msg.CommandIndex, snapshotData)
+			// Check raft persister size. Concurrent version.
+			if atomic.LoadInt32(&kv.isSnapshoting) == 0 && kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				kv.snapshotStateMutex.Lock()
+				if atomic.LoadInt32(&kv.isSnapshoting) == 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				    atomic.StoreInt32(&kv.isSnapshoting, 1)
+				    snapshotData := kv.createSnapshot()
+				    kv.rf.Snapshot(msg.CommandIndex, snapshotData)
+				    atomic.StoreInt32(&kv.isSnapshoting, 0)
+				}
+				kv.snapshotStateMutex.Unlock()
 			}
 		} else if msg.SnapshotValid {
 			// Receive snapshot
@@ -311,14 +329,14 @@ func (kv *KVServer) applier() {
 		} else if msg.SnapshotValid {
 			indexToNotify.index = (int64)(msg.SnapshotIndex)
 			indexToNotify.term = (int64)(msg.SnapshotTerm)
-		} 
+		}
 		waitToRemove := make([]int, 0, 1)
 		kv.applyListenersMutex.RLock()
 		for i, v := range kv.applyListeners {
 			// log.Info(kv.me, " before notifying one listener about index update")
 			select {
 			case v.indexCh <- indexToNotify:
-			case <- v.exitCh:
+			case <-v.exitCh:
 				waitToRemove = append(waitToRemove, i)
 			}
 			// log.Info(kv.me, " notified one listener about index update")
@@ -332,13 +350,13 @@ func (kv *KVServer) applier() {
 	}
 }
 
-
 func (kv *KVServer) createSnapshot() []byte {
-	kv.dataMutex.RLock()
-	defer kv.dataMutex.RUnlock()
+	kv.snapshotMutex.RLock()
+	defer kv.snapshotMutex.RUnlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.data)
+	e.Encode(kv.serialNos)
 	data := w.Bytes()
 	return data
 }
@@ -346,17 +364,23 @@ func (kv *KVServer) createSnapshot() []byte {
 func (kv *KVServer) applySnapshot(snapshotData []byte) {
 	r := bytes.NewBuffer(snapshotData)
 	d := labgob.NewDecoder(r)
-	kv.dataMutex.Lock()
-	defer kv.dataMutex.Unlock()
-	newData := make(map[string]string)
-	if d.Decode(&newData) != nil {
+	kv.snapshotMutex.Lock()
+	defer kv.snapshotMutex.Unlock()
+	newData := make([]map[string]string, 0)
+	newSerialNos := make(map[string]int64)
+	if d.Decode(&newData) != nil ||
+		d.Decode(&newSerialNos) != nil {
 		panic("failed to decode kv data")
 	} else {
 		kv.data = newData
+		kv.serialNos = newSerialNos
 	}
 }
 
-
+// func (kv *KVServer) commandHandler(bucketInd int) {
+	// for {
+	// }
+// }
 
 //
 // servers[] contains the ports of the set of
@@ -385,7 +409,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.data = make(map[string]string)
+	kv.data = make([]map[string]string, NumOfDataBuckets)
+	kv.dataMutex = make([]sync.RWMutex, NumOfDataBuckets)
+	kv.msgCh = make([]chan raft.ApplyMsg, NumOfDataBuckets)
+	for i := 0; i < NumOfDataBuckets; i++ {
+		kv.data[i] = make(map[string]string)
+		kv.msgCh[i] = make(chan raft.ApplyMsg)
+	}
 	kv.serialNos = make(map[string]int64)
 	kv.persister = persister
 
