@@ -410,13 +410,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 
-	log.WithFields(log.Fields{
-		"term": prevTerm,
-	}).Info(rf.me, " RequestVote: logMutex locking")
 	rf.logMutex.RLock()
-	log.WithFields(log.Fields{
-		"term": prevTerm,
-	}).Info(rf.me, " RequestVote: logMutex locked")
 	defer rf.logMutex.RUnlock()
 	whoIVotedFor := atomic.LoadInt64(&rf.votedFor)
 	if whoIVotedFor == -1 || whoIVotedFor == args.CandidateId {
