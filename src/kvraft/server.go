@@ -252,54 +252,59 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applier() {
 	for msg := range kv.applyCh {
 		if msg.CommandValid {
-			c, ok := msg.Command.([]byte)
-			if ok {
+			switch c := msg.Command.(type) {
+			case []byte:
 				// Check whether command is no-op
-				if len(c) == 0 {
-					log.WithFields(log.Fields{
-						"index": msg.CommandIndex,
-						"term":  msg.CommandTerm,
-					}).Info(kv.me, " received no-op")
-				} else {
-					var args map[string]string
-					if err := json.Unmarshal(c, &args); err != nil {
-						panic("failed to decode msg operation type")
-					}
-					clerkId, ok := args["ClerkId"]
-					if !ok {
-						panic("failed to access clerk id")
-					}
-
-					_, ok = kv.serialNos[clerkId]
-					if !ok {
-						kv.serialNos[clerkId] = 0
-					}
-
+				// if len(c) == 0 {
 					// log.WithFields(log.Fields{
-						// "clerkId":  clerkId,
-						// "serialNo": kv.serialNos[clerkId],
-						// "index":    msg.CommandIndex,
-						// "term":     msg.CommandTerm,
-					// }).Info(kv.me, args)
+						// "index": msg.CommandIndex,
+						// "term":  msg.CommandTerm,
+					// }).Info(kv.me, " received no-op")
+				// } else {
+				var args map[string]string
+				if err := json.Unmarshal(c, &args); err != nil {
+					panic("failed to decode msg operation type")
+				}
+				clerkId, ok := args["ClerkId"]
+				if !ok {
+					panic("failed to access clerk id")
+				}
 
-					serialStr, ok := args["SerialNo"]
-					if ok {
-						serialNo, err := strconv.Atoi(serialStr)
-						if err != nil {
-							panic("failed to convert serial string to number")
+				_, ok = kv.serialNos[clerkId]
+				if !ok {
+					kv.serialNos[clerkId] = 0
+				}
+
+				// log.WithFields(log.Fields{
+					// "clerkId":  clerkId,
+					// "serialNo": kv.serialNos[clerkId],
+					// "index":    msg.CommandIndex,
+					// "term":     msg.CommandTerm,
+				// }).Info(kv.me, args)
+
+				serialStr, ok := args["SerialNo"]
+				if ok {
+					serialNo, err := strconv.Atoi(serialStr)
+					if err != nil {
+						panic("failed to convert serial string to number")
+					}
+					if (int64)(serialNo) > kv.serialNos[clerkId] {
+						_, ok := args["Value"]
+						if ok {
+							kv.putAppend(args["Key"], args["Value"], args["Op"])
 						}
-						if (int64)(serialNo) > kv.serialNos[clerkId] {
-							_, ok := args["Value"]
-							if ok {
-								kv.putAppend(args["Key"], args["Value"], args["Op"])
-							}
-							// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
-							kv.serialNos[clerkId] = (int64)(serialNo)
-							// log.Info(kv.me, args, " applied")
-						}
+						// atomic.StoreInt64(&kv.serialNo, (int64)(serialNo))
+						kv.serialNos[clerkId] = (int64)(serialNo)
+						// log.Info(kv.me, args, " applied")
 					}
 				}
-			} else {
+				// }
+			case bool:
+				log.WithFields(log.Fields{
+					"index": msg.CommandIndex,
+					"term":  msg.CommandTerm,
+				}).Info(kv.me, " received no-op")
+			default:
 				panic("Command is not no-op nor bytes")
 			}
 

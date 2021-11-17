@@ -1,0 +1,33 @@
+1. Why the apply channel is blocked? How to avoid blocking?
+	No idea. Clone needed data and use goroutine. Even if so, the data will be still blocked.
+	So we have to find out why the blocking happens.
+
+2. Will snapshoting affect commands application?
+	No. They are protected by the log mutex.
+
+3. Does the service snapshot more than commit index?
+	Quite unlikely. But I will add a test.
+
+4. The leader sends nil entries to followers after not receiving installsnapshot reply.
+	The leader sends installsnapshot even if all entries have been received.
+	Why does the leader's prevLogTerm become 0?
+	And If leader doesn't receive snapshot request, how come its log first index change?
+
+	Result: the leader's log entries all become empty after snapshoting
+
+5. When follower appends entries, its prevCommitIndex may be smaller than its log first index.
+	since it may receive a install snapshot rpc first.
+	Should we update commitIndex when receiving InstallSnapshot rpc?
+	Well, it has done that already.
+	So it's AppendEntries rpc blocked after InstallSnapshot rpc?
+
+	Why is its prevCommitIndex smaller than logFirstIndex?
+	If it's leader, snapshot's last index is smaller than commitIndex.
+	If it's follower, its commitIndex is set to logFirstIndex when installing snapshot.
+
+	The original leader 1 has commitIndex up to 15. Why does it become 0 when 1 becomes follower?
+	1 remade.
+
+6. Why does the unreliableInstall take so long?
+	case 1: leader often disconnects. Slow to propagate msg.
+	case 2: too many locks.

@@ -1,0 +1,215 @@
+1. How to let rpc handler know the operation is finished?
+	Solution 1: Use channel to notify. Then we need one channel for each rpc. Not good.
+	Solution 2: Use applied index to notify. Then how to let handler know? Spin checking is wasteful. Periodically checking? Maybe use channel to implement a listener model.
+
+2. Why the indexCh is blocked?
+	it's not initialized.
+
+3. Why didn't the service receive PutAppend applyMsg?
+
+4. Why is the applyCh's first msg Get? It should be a PutAppend. 
+
+5. Why the indexCh is blocked again?
+
+
+6. Why does it send the same msg repeatedly?
+	Not reply OK
+
+7. How to handle situations that the leader fails to reply or is partitioned?
+	the leader lives.
+		the leader is partitioned into a smaller faction. 
+			the leader can no longer commit operation.
+				Shall we wait for reply forever?
+				Or timeout to switch to a new leader?
+	the leader dies.
+		the best method of avoiding duplicate requests is to modify Start.
+		the leader has received a submission but not sent its corresponding applyMsg.
+			Shall the clerk timeout? 
+				Yes. Then it sends the same request to a new leader.
+					What if the new leader already has the log entry just not commited? Then we have two log entries of the same operation with different indices and terms.
+						Solution 2: add first Start's returned index to Clerk's rpc reply. And put timer into server's handlers.
+							Use index or term to determine the msg is outdated?
+							Only apply operation if its index matches first Start's returned index.
+					What if the new leader does not have the log entry which means majority of servers do not have it?
+						Use Solution 2 above.
+							What if another operation occupies the index when we're waiting?
+								Use term? Will it lead to duplicate operations?
+								Igore old index and only apply when new index arrives?
+									But applier has no idea about whether it's new or outdated msg.
+					Can we prevent duplicate entries from submitting in the beginning?
+						Yes! Use first Start's returned index as an unique id. If the new leader has the corresponding entry and the term matches, then it needn't append a new entry.
+						Or avoid applying repeatedly since we have unique id. Just use timestamp.
+							Then we need to record timestamps.
+							
+			How to distinguish this case from above one?
+			
+
+8. What if a Raft leader dies after commiting but before sending applyMsg?
+
+9. Persist() costs too much time. Can it be more effcient?
+	
+
+
+
+10. Out of index when removing listeners?
+	Indice change when removing ascendingly.
+
+11. Query results are not correct.
+	But all servers have written correctly.
+
+
+12. Why does server send duplicate append requests when there is no timeout or wrongleader?
+	case 1: rpc has internal timeout. unlikely
+	case 2: test resends.
+	case 3: start returns 0 index and 0 term.
+	case 4: the leader died after committing log but before finishing rpc reply.
+
+
+13. What is linear semantics?
+
+
+14. How to refactor commit mechanics to speed up raft?
+
+
+
+15. How does the leader know it's partioned into a smaller network?
+	When raft not sends back needed ApplyMsg?
+		ApplyMsg depends on commitIndex only.
+			Case 1: still leader; Many followers die or it's partioned.
+			Case 2: lose status; Last loop of leader's talk?
+
+16. Why do we need timeout?
+	Leader may lose its status and never send ApplyMsg back. (not dead)
+		Case 1: Command propagated to new leader but still not committed. New leader will commit it thus previous instance can follow. (ApplyMsg received)
+		Case 2: New leader doesn't know about the command. (ApplyMsg not received, blocking forever)
+			How do we distinguish this case from leader being partitioned into a smaller group?
+				New leader commits a no-op entry. And service detects term change.
+	So if we can detect leadership change in another way, timeout is not needed. Thus it can wait forever due to partition.
+	We don't need timeout in kvserver.
+
+
+
+17. Which states to persist in kvserver?
+	listeners?
+		No, rpc will just return not ok. Then clerks will try next peer.
+	data.
+	latestSerialNo.
+
+18. Wait, 3B says that without snapshot we should replay whole log to restore state after restarting.
+	So after restarting raft should send ApplyMsg from the beginning.
+		Sending ApplyMsg is controlled by lastApplied and commitIndex.
+			We shouldn't persist lastApplied.
+
+19. Why are received msgs out of order?
+	Index jump happened at ApplyCh.
+		Concurrent sends?
+			Use one specific goroutine to send all msgs?
+			Or just remove go before sendApplyMsg().
+				logMutex causes deadlock between AppendEntries() and RequestVote().
+				AppendEntries accumlates many locks.
+					Thus candidate can't become leader since log lock can't be acquired.
+	SerialNo
+	Index
+
+
+20. Print log with many entires may lead to candidate losing the election.
+	Printing takes so much time.
+
+
+21. What causes logMutex Rlock blocking?
+	Is there a possibility that Rlock covers all the time so lock can't be acquired?
+		According to go101, it's not true.
+		And it's Rlock blocking not lock.
+	Is applyCh blocked?
+		applyCh only uses Rlock so it can't lead to Rlock blocking.
+	It must be that someone holds lock not releasing.
+		Who can hold lock?
+			Only those who change log.
+				Leader: Start(), Snapshot()
+					Not start().
+				Follower: AppendEntries(), InstallSnapshot()
+					AppendEntries does block.(try to lock but failed)
+	It's confirmed that commitIndexMutex in AppendEntries blocks. Or it died before reaching there. (died there each time? doubtful)
+		After reducing its use in AppendEntries, no longer blocks.
+
+	Snapshot blocks applyCh.
+
+22. If raft is too slow, it may cause various timeouts leading to weird bugs.
+
+
+23. What is linearizability? How to ensure it? 
+	Operations appear to finish instantly.(In perspective of order)
+	It's supposed to be ensuresd by order of log entries.
+		But operations in log may not be in the same order of which they are invoked due to different network delay and clerk retries.
+			Consider only clerk retries.
+
+24. TestPersistUnreliable3A sometimes succeeds.
+
+
+25. Why does kvserver always receives msg with serialNo equal to its?
+	Just too many duplitcate msgs.
+		Clerk didn't receive success reply.
+
+26. When to detect raft persister size?
+	Start()?
+	applier()?
+		applier() knows how many entries the kv server applied. And snapshot() needs this info.
+
+27. What should be included in the snapshot?
+	raft will send snapshot back.
+	So just kv data?
+
+28. Which kv servers will receive snapshot?
+	Each one at start.
+	Followers who request data in snapshot.
+
+29. When should we update leader's commitIndex?
+	After receiving AppendEntries reply.
+	Periodically checking.
+		
+	Not much speed difference.
+
+30. When should we check leader's lastApplied?
+	After updating commitIndex.
+
+
+31. Why does a snapshot have lastIncludedIndex smaller than previous one's?
+	Msg is not sent ascendingly?
+		No.
+	Multple snapshot() blocks then latter one gets executed first?
+		Quite probable.
+		So how to make them execute in order?
+
+32. runlock of unlocked rwmutex?
+	No such code found.
+	Fake error message.
+		true reason is that the server accessed log with negative index.
+
+33. How to improve throughput?
+	Concurrent applier.
+		Then how to guarantee order?
+			seperate msgs by key or say hashed key.
+			use seperate data containers?
+	hash key to access rwmutex.
+	remove indexListeners.
+	Or just reduce interval between sending appendEntries.
+
+34. There are duplicate data after installing snapshot. 
+	Possible reason 1: Retry gets recorded in log. And snapshot doesn't contain serialNos.
+		include serialNos in the snapshot.
+
+35. How to remove useless serialNos?
+
+
+36. sendApplyMsg does not guarantee that msgs are sent in time order. How to fix it?
+	sendApplyMsg is idemponent. So no big deal.
+
+37. Why snapshot() gets index larger than commitIndex?
+	applyMsg has index larger than commitIndex.
+		it must have something to do with receiving snapshot.
+			in installSnapshot(), checking commitIndex and setting it is not in a sync block.
+	installSnapshot(): lastIncludedIndex is smaller than current commitIndex.
+	
+
+38. When sending logEntries, nextIndex may have 0 length? Why?
+	Role is set before nextIndex is initialized.
