@@ -28,6 +28,18 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (c *Config) deepcopy() Config {
+	newConfig := Config{}
+	newConfig.Num = c.Num
+	newConfig.Shards = c.Shards
+	groups := make(map[int][]string)
+	for k, v := range c.Groups {
+		groups[k] = append([]string(nil), v...)
+	}
+	newConfig.Groups = groups
+	return newConfig
+}
+
 const (
 	OK = "OK"
 	ErrWrongLeader = "ErrWrongLeader"
@@ -35,8 +47,18 @@ const (
 
 type Err string
 
-type JoinArgs struct {
+type ClerkHeader struct {
+	ClerkId int64
+	SerialNo int64
+}
+
+type JoinArgsBody struct {
 	Servers map[int][]string // new GID -> servers mappings
+}
+
+type JoinArgs struct {
+	Header  ClerkHeader
+	Body    JoinArgsBody
 }
 
 type JoinReply struct {
@@ -44,8 +66,13 @@ type JoinReply struct {
 	Err         Err
 }
 
-type LeaveArgs struct {
+type LeaveArgsBody struct {
 	GIDs []int
+}
+
+type LeaveArgs struct {
+	Header  ClerkHeader
+	Body    LeaveArgsBody
 }
 
 type LeaveReply struct {
@@ -53,9 +80,14 @@ type LeaveReply struct {
 	Err         Err
 }
 
-type MoveArgs struct {
+type MoveArgsBody struct {
 	Shard int
 	GID   int
+}
+
+type MoveArgs struct {
+	Header  ClerkHeader
+	Body    MoveArgsBody
 }
 
 type MoveReply struct {
@@ -63,8 +95,13 @@ type MoveReply struct {
 	Err         Err
 }
 
-type QueryArgs struct {
+type QueryArgsBody struct {
 	Num int // desired config number
+}
+
+type QueryArgs struct {
+	Header  ClerkHeader
+	Body    QueryArgsBody
 }
 
 type QueryReply struct {

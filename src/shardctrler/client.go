@@ -8,10 +8,19 @@ import "6.824/labrpc"
 import "time"
 import "crypto/rand"
 import "math/big"
+import "sync"
+import "sync/atomic"
+import (
+	log "github.com/sirupsen/logrus"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	prevLeaderId int
+	serialNo     int64
+	uid          int64
+	mu           sync.RWMutex
 }
 
 func nrand() int64 {
@@ -25,77 +34,157 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.prevLeaderId = 0
+	ck.serialNo = 0
+	ck.uid = time.Now().UnixNano()
+
+
+
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
-	// Your code here.
-	args.Num = num
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := QueryArgs{Header: ClerkHeader{SerialNo: atomic.AddInt64(&ck.serialNo, 1), ClerkId: ck.uid}, Body: QueryArgsBody{Num: num}}
+	var reply QueryReply
+
+	// assume previous leader is still in position
+	ok := ck.servers[ck.prevLeaderId].Call("ShardCtrler.Query", &args, &reply)
+	if ok {
+		switch reply.Err {
+		case OK:
+			return reply.Config
+		case ErrWrongLeader:
+		}
+	}
+	initialSkip := true
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply QueryReply
-			ok := srv.Call("ShardCtrler.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return reply.Config
+		for i, v := range ck.servers {
+			if initialSkip && i == ck.prevLeaderId {
+				initialSkip = false
+				continue
+			}
+			ok := v.Call("ShardCtrler.Query", &args, &reply)
+			if ok {
+				switch reply.Err {
+				case OK:
+					ck.prevLeaderId = i
+					return reply.Config
+				case ErrWrongLeader:
+				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
-	// Your code here.
-	args.Servers = servers
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := JoinArgs{Header: ClerkHeader{SerialNo: atomic.AddInt64(&ck.serialNo, 1), ClerkId: ck.uid}, Body: JoinArgsBody{Servers: servers}}
+	var reply JoinReply
+	ok := ck.servers[ck.prevLeaderId].Call("ShardCtrler.Join", &args, &reply)
+	if ok {
+		switch reply.Err {
+		case OK:
+			return
+		}
+	} else {
+		log.Info(ck.prevLeaderId, " rpc call is not ok")
+	}
 
+	initialSkip := true
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply JoinReply
-			ok := srv.Call("ShardCtrler.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
+		for i, v := range ck.servers {
+			if initialSkip && i == ck.prevLeaderId {
+				initialSkip = false
+				continue
+			}
+			ok := v.Call("ShardCtrler.Join", &args, &reply)
+			if ok {
+				switch reply.Err {
+				case OK:
+					ck.prevLeaderId = i
+					return
+				case ErrWrongLeader:
+				}
+			} else {
+				log.Info(i, " rpc call is not ok")
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
-	// Your code here.
-	args.GIDs = gids
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := LeaveArgs{Header: ClerkHeader{SerialNo: atomic.AddInt64(&ck.serialNo, 1), ClerkId: ck.uid}, Body: LeaveArgsBody{GIDs: gids}}
+	var reply LeaveReply
+	ok := ck.servers[ck.prevLeaderId].Call("ShardCtrler.Leave", &args, &reply)
+	if ok {
+		switch reply.Err {
+		case OK:
+			return
+		}
+	} else {
+		log.Info(ck.prevLeaderId, " rpc call is not ok")
+	}
 
+	initialSkip := true
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply LeaveReply
-			ok := srv.Call("ShardCtrler.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
+		for i, v := range ck.servers {
+			if initialSkip && i == ck.prevLeaderId {
+				initialSkip = false
+				continue
+			}
+			ok := v.Call("ShardCtrler.Leave", &args, &reply)
+			if ok {
+				switch reply.Err {
+				case OK:
+					ck.prevLeaderId = i
+					return
+				case ErrWrongLeader:
+				}
+			} else {
+				log.Info(i, " rpc call is not ok")
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
-	// Your code here.
-	args.Shard = shard
-	args.GID = gid
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := MoveArgs{Header: ClerkHeader{SerialNo: atomic.AddInt64(&ck.serialNo, 1), ClerkId: ck.uid}, Body: MoveArgsBody{Shard: shard, GID: gid}}
+	var reply MoveReply
+	ok := ck.servers[ck.prevLeaderId].Call("ShardCtrler.Move", &args, &reply)
+	if ok {
+		switch reply.Err {
+		case OK:
+			return
+		}
+	} else {
+		log.Info(ck.prevLeaderId, " rpc call is not ok")
+	}
 
+	initialSkip := true
 	for {
-		// try each known server.
-		for _, srv := range ck.servers {
-			var reply MoveReply
-			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
-				return
+		for i, v := range ck.servers {
+			if initialSkip && i == ck.prevLeaderId {
+				initialSkip = false
+				continue
+			}
+			ok := v.Call("ShardCtrler.Move", &args, &reply)
+			if ok {
+				switch reply.Err {
+				case OK:
+					ck.prevLeaderId = i
+					return
+				case ErrWrongLeader:
+				}
+			} else {
+				log.Info(i, " rpc call is not ok")
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }

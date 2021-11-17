@@ -985,6 +985,7 @@ func (rf *Raft) sendEntriesToPeer(peer int, replyCh chan bool) {
 		if logLength < nextIndex+1 {
 			args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: nextIndex - 1, PrevLogTerm: prevLogTerm, Entries: []LogEntry{}, LeaderCommit: leaderCommit}
 		} else {
+			// making a copy to avoid data race. Though it is probably unnecessary if peers are not on the same machine.
 			args = AppendEntriesArgs{Term: term, LeaderId: rf.me, PrevLogIndex: nextIndex - 1, PrevLogTerm: prevLogTerm, Entries: append([]LogEntry(nil), rf.log[nextIndex-rf.logFirstIndex : logLength-rf.logFirstIndex]...), LeaderCommit: leaderCommit}
 		}
 		rf.logMutex.RUnlock()

@@ -22,6 +22,7 @@ const Debug = false
 const (
 	ServiceRPCTimeout = 5 * time.Second
 	NumOfDataBuckets  = 10
+	SizeOfApplyChBuffer = 10 // Not much improvemnt compared to unbuffered
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -412,7 +413,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, SizeOfApplyChBuffer)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.data = make([]map[string]string, NumOfDataBuckets)
 	kv.dataMutex = make([]sync.RWMutex, NumOfDataBuckets)
