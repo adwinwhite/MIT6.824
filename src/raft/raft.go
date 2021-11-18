@@ -129,6 +129,10 @@ type Raft struct {
 	logFirstIndex    int64
 }
 
+func (rf *Raft) Persister() *Persister {
+	return rf.persister
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {

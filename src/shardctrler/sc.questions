@@ -1,0 +1,19 @@
+1. What should raft log store?
+	Operations like Join, Leave, Move and Query?
+		We can recover []Config from log.
+		Maybe this is the better approacch.
+	Or a complete Config?
+		Then log is almost the same as []Config.
+
+2. May we reuse some code for server's rpc handler?
+	They are almost the same except operation name.(two class: read and write)
+
+3. After shutdowning previous leader, new leader has different latest config from previous one's.
+	Same Operations do not lead to same config?
+		Yes. It happened when there are concurrent Join/Leave.
+		Why does a newly joined group have a shard before balancing?
+			Well, actually balancing has started.
+		Two newly joined groups. Different choices for which to fill first.
+			Map's keys are unordered. Thus introducing randomness.
+
+4. Can we remove lock for clerk while perserving linearizability?

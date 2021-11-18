@@ -18,8 +18,13 @@ const (
 
 type Err string
 
+type ClerkHeader struct {
+	ClerkId int64
+	SerialNo int64
+}
+
 // Put or Append
-type PutAppendArgs struct {
+type PutAppendArgsBody struct {
 	// You'll have to add definitions here.
 	Key   string
 	Value string
@@ -29,13 +34,23 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 }
 
+type PutAppendArgs struct {
+	Header    ClerkHeader
+	Body      PutAppendArgsBody
+}
+
 type PutAppendReply struct {
 	Err Err
 }
 
-type GetArgs struct {
+type GetArgsBody struct {
 	Key string
 	// You'll have to add definitions here.
+}
+
+type GetArgs struct {
+	Header   ClerkHeader
+	Body     GetArgsBody
 }
 
 type GetReply struct {

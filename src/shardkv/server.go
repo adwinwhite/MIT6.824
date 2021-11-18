@@ -6,13 +6,14 @@ import "6.824/raft"
 import "sync"
 import "6.824/labgob"
 
+import (
+	log "github.com/sirupsen/logrus"
+	"fmt"
+	"bytes"
+)
 
 
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
+
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -25,15 +26,157 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	applyListeners      []BroadcastChan
+	applyListenersMutex sync.RWMutex
+
+	data          map[string]string
+	dataMutex     sync.RWMutex
+	snapshotMutex sync.RWMutex
+
+	serialNos map[int64]int64
+}
+
+// I wish there is tuple
+type IndexAndTerm struct {
+	index int64
+	term  int64
+}
+
+type BroadcastChan struct {
+	indexCh chan IndexAndTerm
+	exitCh  chan struct{}
+}
+
+func removeBroadcastCh(s []BroadcastChan, i int) []BroadcastChan {
+	s[i] = s[len(s)-1]
+	return s[:len(s)-1]
+}
+
+
+type Op struct {
+	// Your data here.
+	Name string
+	Args interface{}
+	ClerkInfo ClerkHeader
+}
+
+func (kv *ShardKV) get(key string) (value string, err Err) {
+	kv.snapshotMutex.RLock()
+	defer kv.snapshotMutex.RUnlock()
+	kv.dataMutex.RLock()
+	defer kv.dataMutex.RUnlock()
+	value, ok := kv.data[key]
+	if ok {
+		err = OK
+	} else {
+		err = ErrNoKey
+	}
+	return value, err
+}
+
+func (kv *ShardKV) putAppend(key string, value string, op string) {
+	kv.snapshotMutex.RLock()
+	defer kv.snapshotMutex.RUnlock()
+	kv.dataMutex.Lock()
+	defer kv.dataMutex.Unlock()
+	switch op {
+	case "Put":
+		kv.data[key] = value
+	case "Append":
+		val, ok := kv.data[key]
+		if ok {
+			kv.data[key] = val + value
+		} else {
+			kv.data[key] = value
+		}
+	}
 }
 
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{Name: "Get", Args: args.Body, ClerkInfo: args.Header}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	var ls BroadcastChan
+	ls.indexCh = make(chan IndexAndTerm)
+	ls.exitCh = make(chan struct{})
+	defer close(ls.exitCh)
+	kv.applyListenersMutex.Lock()
+	kv.applyListeners = append(kv.applyListeners, ls)
+	log.WithFields(log.Fields{
+		"index": index,
+		"term":  term,
+	}).Info(kv.me, " Get ", fmt.Sprintf("%+v", args))
+	kv.applyListenersMutex.Unlock()
+	// Determine whether applyMsg matches command.
+	// Case 1: entry at index is what we submitted.
+	// Case 2: entry at index is not what we submitted due to the leader died or lost leadership before propagating this entry.
+	// Just check term of entry at index.
+	// What if it's a snapshot? Leader only sends snapshot at restart. Index of snapshot is guaranteed to be smaller than what we need.
+	for {
+		indexWithTerm := <-ls.indexCh
+		// Is there a chance that indexWithTerm.index is greater than index?
+		if indexWithTerm.index == (int64)(index) {
+			if indexWithTerm.term == (int64)(term) {
+				reply.Value, reply.Err = kv.get(args.Body.Key)
+				return
+			} else {
+				reply.Err = ErrWrongLeader
+				return
+			}
+		}
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	// Reply Ok by default.
+	reply.Err = OK
+	// Check whether I am leader
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{Name: "PutAppend", Args: args.Body, ClerkInfo: args.Header}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	var ls BroadcastChan
+	ls.indexCh = make(chan IndexAndTerm)
+	ls.exitCh = make(chan struct{})
+	defer close(ls.exitCh)
+	kv.applyListenersMutex.Lock()
+	kv.applyListeners = append(kv.applyListeners, ls)
+	log.WithFields(log.Fields{
+		"index": index,
+		"term":  term,
+	}).Info(kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
+	kv.applyListenersMutex.Unlock()
+
+	for {
+		indexWithTerm := <-ls.indexCh
+		if indexWithTerm.index == (int64)(index) {
+			if indexWithTerm.term == (int64)(term) {
+				return
+			} else {
+				reply.Err = ErrWrongLeader
+				return
+			}
+		}
+	}
 }
 
 //
@@ -45,6 +188,125 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+}
+
+func (kv *ShardKV) applier() {
+	for msg := range kv.applyCh {
+		if msg.CommandValid {
+			switch c := msg.Command.(type) {
+			case Op:
+				clerkId := c.ClerkInfo.ClerkId
+				
+				// Check whether serialNo for this clerk exists
+				_, ok := kv.serialNos[clerkId]
+				if !ok {
+					kv.serialNos[clerkId] = 0
+				}
+
+				// Only apply command if msg's serialNo is larger than recorded one so that duplicate command won't be applied
+				if c.ClerkInfo.SerialNo > kv.serialNos[clerkId] {
+					switch c.Name {
+					case "Get":
+					case "PutAppend":
+						args, ok := c.Args.(PutAppendArgsBody)
+						if !ok {
+							panic("failed to assert args as JoinArgsBody")
+						}
+						kv.putAppend(args.Key, args.Value, args.Op)
+					}
+					// kv.configMutex.RLock()
+					// log.WithFields(log.Fields{
+						// "id": kv.me,
+						// "index": msg.CommandIndex,
+					// }).Info(kv.configs[len(kv.configs) - 1])
+					// kv.configMutex.RUnlock()
+				}
+			case bool:
+				log.WithFields(log.Fields{
+					"index": msg.CommandIndex,
+					"term":  msg.CommandTerm,
+				}).Info(kv.me, " received no-op")
+			default:
+				panic("Command is not no-op nor bytes")
+			}
+
+			if kv.maxraftstate > 0 && kv.rf.Persister().RaftStateSize() > kv.maxraftstate {
+				snapshotData := kv.createSnapshot()
+				kv.rf.Snapshot(msg.CommandIndex, snapshotData)
+			}
+
+			// Check raft persister size. Concurrent version.
+			// if atomic.LoadInt32(&kv.isSnapshoting) == 0 && kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				// kv.snapshotStateMutex.Lock()
+				// if atomic.LoadInt32(&kv.isSnapshoting) == 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				    // atomic.StoreInt32(&kv.isSnapshoting, 1)
+				    // snapshotData := kv.createSnapshot()
+				    // kv.rf.Snapshot(msg.CommandIndex, snapshotData)
+				    // atomic.StoreInt32(&kv.isSnapshoting, 0)
+				// }
+				// kv.snapshotStateMutex.Unlock()
+			// }
+		} else if msg.SnapshotValid {
+			// Receive snapshot
+			kv.applySnapshot(msg.Snapshot)
+		} else {
+			continue
+		}
+
+		// Notify all listeners about index&term of msg
+		var indexToNotify IndexAndTerm
+		if msg.CommandValid {
+			indexToNotify.index = (int64)(msg.CommandIndex)
+			indexToNotify.term = msg.CommandTerm
+		} else if msg.SnapshotValid {
+			indexToNotify.index = (int64)(msg.SnapshotIndex)
+			indexToNotify.term = (int64)(msg.SnapshotTerm)
+		}
+		waitToRemove := make([]int, 0, 1)
+		kv.applyListenersMutex.RLock()
+		for i, v := range kv.applyListeners {
+			// log.Info(kv.me, " before notifying one listener about index update")
+			select {
+			case v.indexCh <- indexToNotify:
+			case <-v.exitCh:
+				waitToRemove = append(waitToRemove, i)
+			}
+			// log.Info(kv.me, " notified one listener about index update")
+		}
+		kv.applyListenersMutex.RUnlock()
+		kv.applyListenersMutex.Lock()
+		for i := len(waitToRemove) - 1; i >= 0; i-- {
+			kv.applyListeners = removeBroadcastCh(kv.applyListeners, waitToRemove[i])
+		}
+		kv.applyListenersMutex.Unlock()
+	}
+}
+
+func (kv *ShardKV) createSnapshot() []byte {
+	kv.snapshotMutex.RLock()
+	defer kv.snapshotMutex.RUnlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.serialNos)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *ShardKV) applySnapshot(snapshotData []byte) {
+	r := bytes.NewBuffer(snapshotData)
+	d := labgob.NewDecoder(r)
+	kv.snapshotMutex.Lock()
+	defer kv.snapshotMutex.Unlock()
+	newData := make(map[string]string, 0)
+	newSerialNos := make(map[int64]int64)
+	if d.Decode(&newData) != nil ||
+		d.Decode(&newSerialNos) != nil {
+		panic("failed to decode kv data")
+	} else {
+		kv.data = newData
+		kv.serialNos = newSerialNos
+	}
 }
 
 
@@ -89,12 +351,19 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.ctrlers = ctrlers
 
 	// Your initialization code here.
+	labgob.Register(Op{})
+	labgob.Register(ClerkHeader{})
+	labgob.Register(GetArgsBody{})
+	labgob.Register(PutAppendArgsBody{})
 
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.serialNos = make(map[int64]int64)
+	go kv.applier()
 
 
 	return kv
