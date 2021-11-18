@@ -8,7 +8,8 @@ import "6.824/labgob"
 import (
 	log "github.com/sirupsen/logrus"
 	"fmt"
-	"math"
+	// "math"
+	"sort"
 	// "bytes"
 	// "encoding/gob"
 )
@@ -85,21 +86,21 @@ func balanceShards(shards *[NShards]int, servers map[int][]string) {
 	if len(shards) == 0 || len(servers) == 0{
 		return
 	}
+	// log.Info("shards: ", shards)
+	// log.Info("servers: ", servers)
+
+
 
 	// How many shards should a group serve?
-	aveShards := float64(len(shards)) / float64(len(servers))
+	// aveShards := float64(len(shards)) / float64(len(servers))
 
 	// Count how many shards a group actually serve now.
 	counts := make(map[int][]int)
 	leavingGroups := make([]int, 0)
 	for k := range servers {
-		counts[k] = make([]int, (int)(math.Ceil(aveShards)))
+		counts[k] = make([]int, 0)
 	}
 	for s, g := range shards {
-		// Do not count invalid gid 0
-		if g == 0 {
-			continue
-		}
 		_, ok := counts[g]
 
 		// gid may not exists if it left
@@ -110,56 +111,83 @@ func balanceShards(shards *[NShards]int, servers map[int][]string) {
 			leavingGroups = append(leavingGroups, g)
 		}
 	}
-	// Flatten shards belongingto leavingGroups
+	// Flatten shards belonging to leavingGroups and remove them from counts
 	unservedShards := make([]int, 0)
 	for _, g := range leavingGroups {
 		unservedShards = append(unservedShards, counts[g]...)
+		delete(counts, g)
 	}
+	// Add shards that point to invalid gid 0
+	unservedShards = append(unservedShards, counts[0]...)
+	delete(counts, 0)
+	// log.Info("initial counts: ", counts)
 
-	aboveAve := make(map[int][]int)
-	almostAve := make(map[int][]int)
-	belowAve := make(map[int][]int)
-	for k, v := range counts {
-		if len(v) > (int)(math.Ceil(aveShards)) {
-			aboveAve[k] = v
-		} else if len(v) < (int)(math.Floor(aveShards)) {
-			belowAve[k] = v
-		} else {
-			almostAve[k] = v
-		}
+	// Sort groups by length
+	gids := make([]int, 0)
+	for g := range counts {
+		gids = append(gids, g)
 	}
-
-
-
-	for k, v := range belowAve {
-		for len(v) < (int)(math.Floor(aveShards)) {
-			// First transfer from unserved then from aboveAve
-			if len(unservedShards) > 0 {
-				v = append(v, unservedShards[0])
-				unservedShards = unservedShards[1:]
-			} else {
-				for lk, lv := range aboveAve {
-					if len(lv) > (int)(math.Ceil(aveShards)) {
-						v = append(v, lv[0])
-						aboveAve[lk] = lv[1:]
-					}
-				}
+	// In case of two groups having the same length but having different ordering in servers map. This scenrio exists though I have no idea why.
+	sort.Slice(gids, func(i, j int) bool { 
+		if len(counts[gids[i]]) > len(counts[gids[j]]) {
+			return true
+		} else if len(counts[gids[i]]) == len(counts[gids[j]]) {
+			if gids[i] > gids[j] {
+				return true
 			}
 		}
-		counts[k] = belowAve[k]
-	}
-	for k, v := range aboveAve {
-		counts[k] = v
+		return false
+	})
+	// log.Info("sorted gids: ", gids)
+
+	takeOneShardFromAbundant := func() int {
+		// First take from unserved shards
+		if len(unservedShards) > 0 {
+			oneShard := unservedShards[0]
+			unservedShards = unservedShards[1:]
+			return oneShard
+		} 
+		largestLen := len(counts[gids[0]])
+		rightestGID := gids[0]
+		for i, g := range gids {
+			if len(counts[g]) != largestLen {
+				rightestGID = gids[i - 1]
+				break
+			}
+		}
+		oneShard := counts[rightestGID][0]
+		counts[rightestGID] = counts[rightestGID][1:]
+		return oneShard
 	}
 
-	// By now
-	// If len(unservedShards) > 0, belowAve should be filled and aboveAve is not balanced.
-	// Add them to almostAve
-	for k, v := range belowAve {
-		almostAve[k] = v
+	checkBalance := func() bool {
+		if len(unservedShards) != 0 {
+			return false
+		}
+		// log.Info(gids)
+		// log.Info(counts[gids[0]], counts[gids[len(gids) - 1]])
+		if len(counts[gids[0]]) - len(counts[gids[len(gids) - 1]]) <= 1 {
+			return true
+		}
+		return false
 	}
-	for len(unservedShards) > 0 {
+
+	// Fill from groups with least shards
+	for checkBalance() == false {
+		oneShard := takeOneShardFromAbundant()
+		smallestLen := len(counts[gids[len(gids) - 1]])
+		leftestGID := gids[len(gids) - 1]
+		for _, g := range gids {
+			if len(counts[g]) == smallestLen {
+				leftestGID = g
+				break
+			}
+		}
+		counts[leftestGID] = append(counts[leftestGID], oneShard)
+		// log.Info("current gids: ", gids)
+		// log.Info("current counts: ", counts)
 	}
+
 
 	for g, v := range counts {
 		for _, s := range v {
@@ -410,7 +438,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
-	}).Info(sc.me, " Get ", fmt.Sprintf("%+v", args))
+	}).Info(sc.me, " Query ", fmt.Sprintf("%+v", args))
 	sc.applyListenersMutex.Unlock()
 	// Determine whether applyMsg matches command.
 	// Case 1: entry at index is what we submitted.
@@ -487,6 +515,12 @@ func (sc *ShardCtrler) applier() {
 						sc.move(args.Shard, args.GID)
 					case "Query":
 					}
+					// sc.configMutex.RLock()
+					// log.WithFields(log.Fields{
+						// "id": sc.me,
+						// "index": msg.CommandIndex,
+					// }).Info(sc.configs[len(sc.configs) - 1])
+					// sc.configMutex.RUnlock()
 				}
 			case bool:
 				log.WithFields(log.Fields{
