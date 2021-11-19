@@ -13,6 +13,8 @@ import "crypto/rand"
 import "math/big"
 import "6.824/shardctrler"
 import "time"
+import "sync"
+import "sync/atomic"
 
 //
 // which shard is a key in?
@@ -40,6 +42,10 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	uid      int64
+	serialNo int64
+
+	mu       sync.RWMutex
 }
 
 //
@@ -56,6 +62,9 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.uid = time.Now().UnixNano()
+	ck.serialNo = 0
+	ck.config = ck.sm.Query(-1)
 	return ck
 }
 
@@ -66,8 +75,9 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := GetArgs{Header: ClerkHeader{ClerkId: ck.uid, SerialNo: atomic.AddInt64(&ck.serialNo, 1)}, Body: GetArgsBody{Key: key}}
 
 	for {
 		shard := key2shard(key)
@@ -91,8 +101,6 @@ func (ck *Clerk) Get(key string) string {
 		// ask controler for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 //
@@ -100,10 +108,9 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	args := PutAppendArgs{Header: ClerkHeader{ClerkId: ck.uid, SerialNo: atomic.AddInt64(&ck.serialNo, 1)}, Body: PutAppendArgsBody{Key: key, Value: value, Op: op}}
 
 
 	for {

@@ -10,6 +10,9 @@ import (
 	log "github.com/sirupsen/logrus"
 	"fmt"
 	"bytes"
+	"time"
+
+	"6.824/shardctrler"
 )
 
 
@@ -22,7 +25,8 @@ type ShardKV struct {
 	applyCh      chan raft.ApplyMsg
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
-	ctrlers      []*labrpc.ClientEnd
+	// ctrlers      []*labrpc.ClientEnd
+	ctrler          *shardctrler.Clerk
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
@@ -34,6 +38,9 @@ type ShardKV struct {
 	snapshotMutex sync.RWMutex
 
 	serialNos map[int64]int64
+
+	config        shardctrler.Config
+	configMutex   sync.RWMutex
 }
 
 // I wish there is tuple
@@ -94,6 +101,11 @@ func (kv *ShardKV) putAppend(key string, value string, op string) {
 
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
+	// Check shard first
+	if !kv.isMyShard(key2shard(args.Body.Key)) {
+		reply.Err = ErrWrongGroup
+		return
+	}
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -138,8 +150,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Check shard first
+	if !kv.isMyShard(key2shard(args.Body.Key)) {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
 	// Reply Ok by default.
 	reply.Err = OK
+
 	// Check whether I am leader
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
@@ -189,6 +208,33 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
+
+func (kv *ShardKV) isMyShard(s int) bool {
+	kv.configMutex.RLock()
+	defer kv.configMutex.RUnlock()
+	if kv.config.Shards[s] == kv.gid {
+		return true
+	}
+	return false
+}
+
+func (kv *ShardKV) configDetector() {
+	for {
+		// Query ctrler about latest config
+		latestConfig := kv.ctrler.Query(-1)
+		
+		// Config changed
+		if latestConfig.Num > kv.config.Num {
+			// Request shards' data from other groups
+
+			kv.configMutex.Lock()
+			kv.config = latestConfig
+			kv.configMutex.Unlock()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 
 func (kv *ShardKV) applier() {
 	for msg := range kv.applyCh {
@@ -348,7 +394,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.maxraftstate = maxraftstate
 	kv.make_end = make_end
 	kv.gid = gid
-	kv.ctrlers = ctrlers
+	// kv.ctrlers = ctrlers
 
 	// Your initialization code here.
 	labgob.Register(Op{})
@@ -357,12 +403,15 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(PutAppendArgsBody{})
 
 	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.ctrler = shardctrler.MakeClerk(ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.serialNos = make(map[int64]int64)
+	kv.config = kv.ctrler.Query(-1)
+	kv.data = make(map[string]string)
+	go kv.configDetector()
 	go kv.applier()
 
 
