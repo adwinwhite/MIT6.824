@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"bytes"
 	"time"
+	"sync/atomic"
 
 	"6.824/shardctrler"
 )
@@ -41,6 +42,8 @@ type ShardKV struct {
 
 	config        shardctrler.Config
 	configMutex   sync.RWMutex
+	inMigration   int32
+	migrationCond *sync.Cond
 }
 
 // I wish there is tuple
@@ -218,6 +221,114 @@ func (kv *ShardKV) isMyShard(s int) bool {
 	return false
 }
 
+type RequestShardsArgs struct {
+	Shards []int
+}
+
+type RequestShardsReply struct {
+	ShardsData map[string]string
+	Err        Err
+}
+
+func (kv *ShardKV) RequestShards(args *RequestShardsArgs, reply *RequestShardsReply) {
+	reply.Err = OK
+	// Check whether I am leader
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.dataMutex.RLock()
+	defer kv.dataMutex.RUnlock()
+	// Copy key-value pairs that are in requested shards
+	reply.ShardsData = make(map[string]string)
+	for k, v := range kv.data {
+		s := key2shard(k)
+		isRequested := false
+		for _, rs := range args.Shards {
+			if s == rs {
+				isRequested = true
+				break
+			}
+		}
+		if isRequested {
+			reply.ShardsData[k] = v
+		}
+	}
+}
+
+func (kv *ShardKV) updateShards(oldConf shardctrler.Config, newConf shardctrler.Config) {
+	// log.Info(kv.me, " old config: ", oldConf)
+	// log.Info(kv.me, " new config: ", newConf)
+
+	absentShards := func(oldShards []int, newShards []int) map[int][]int {
+		myOld := make([]int, 0)
+		for s, g := range oldShards {
+			if g == kv.gid {
+				myOld = append(myOld, s)
+			}
+		}
+		
+		// map old gid to shards
+		myAbsent := make(map[int][]int)
+		for s, g := range newShards {
+			if g == kv.gid {
+				exists := false
+				for _, ns := range myOld {
+					if s == ns {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					if myAbsent[oldShards[s]] == nil {
+						myAbsent[oldShards[s]] = append([]int(nil), s)
+					}
+					myAbsent[oldShards[s]] = append(myAbsent[oldShards[s]], s)
+				}
+			}
+		}
+		return myAbsent
+	}(oldConf.Shards[:], newConf.Shards[:])
+
+	// log.Info(kv.me, " absent shards: ", absentShards)
+
+	resultCh := make(chan map[string]string)
+
+	getShards := func(gid int, shards []int, groups map[int][]string, resCh chan map[string]string) {
+		servers, ok := groups[gid]
+		if !ok {
+			panic("No such gid")
+		}
+		args := RequestShardsArgs{Shards: shards}
+		for {
+			for _, srv := range servers {
+				peer := kv.make_end(srv)
+				var reply RequestShardsReply
+				ok = peer.Call("ShardKV.RequestShards", &args, &reply)
+				if ok && reply.Err == OK {
+					resCh <- reply.ShardsData
+					return
+				}
+			}
+		}
+	}
+
+	for g, ss := range absentShards {
+		go getShards(g, ss, oldConf.Groups, resultCh)
+	}
+
+	for i := 0; i < len(absentShards); i++ {
+		shardsData := <- resultCh
+		kv.dataMutex.Lock()
+		for k, v := range shardsData {
+			kv.data[k] = v
+		}
+		kv.dataMutex.Unlock()
+	}
+}
+
 func (kv *ShardKV) configDetector() {
 	for {
 		// Query ctrler about latest config
@@ -225,11 +336,23 @@ func (kv *ShardKV) configDetector() {
 		
 		// Config changed
 		if latestConfig.Num > kv.config.Num {
+			// stop applying new msg
+			atomic.StoreInt32(&kv.inMigration, 1)
 			// Request shards' data from other groups
+			kv.configMutex.RLock()
+			if kv.config.Num > 0 {
+				kv.updateShards(kv.config, latestConfig)
+			}
+			kv.configMutex.RUnlock()
 
 			kv.configMutex.Lock()
 			kv.config = latestConfig
 			kv.configMutex.Unlock()
+
+			kv.migrationCond.L.Lock()
+			atomic.StoreInt32(&kv.inMigration, 0)
+			kv.migrationCond.Broadcast()
+			kv.migrationCond.L.Unlock()
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -238,6 +361,12 @@ func (kv *ShardKV) configDetector() {
 
 func (kv *ShardKV) applier() {
 	for msg := range kv.applyCh {
+		kv.migrationCond.L.Lock()
+		if atomic.LoadInt32(&kv.inMigration) == 1 {
+			kv.migrationCond.Wait()
+		}
+		kv.migrationCond.L.Unlock()
+		
 		if msg.CommandValid {
 			switch c := msg.Command.(type) {
 			case Op:
@@ -411,6 +540,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.serialNos = make(map[int64]int64)
 	kv.config = kv.ctrler.Query(-1)
 	kv.data = make(map[string]string)
+	kv.inMigration = 0
+	kv.migrationCond = sync.NewCond(&sync.Mutex{})
 	go kv.configDetector()
 	go kv.applier()
 
