@@ -21,6 +21,7 @@ type Err string
 type ClerkHeader struct {
 	ClerkId int64
 	SerialNo int64
+	ConfigNo int
 }
 
 // Put or Append

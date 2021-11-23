@@ -1,49 +1,45 @@
 package shardkv
 
-
 import "6.824/labrpc"
 import "6.824/raft"
 import "sync"
 import "6.824/labgob"
 
 import (
-	log "github.com/sirupsen/logrus"
-	"fmt"
 	"bytes"
-	"time"
+	"fmt"
+	log "github.com/sirupsen/logrus"
 	"sync/atomic"
+	"time"
+	"github.com/sasha-s/go-deadlock"
 
 	"6.824/shardctrler"
 )
 
-
-
-
 type ShardKV struct {
-	mu           sync.Mutex
-	me           int
-	rf           *raft.Raft
-	applyCh      chan raft.ApplyMsg
-	make_end     func(string) *labrpc.ClientEnd
-	gid          int
+	mu       sync.Mutex
+	me       int
+	rf       *raft.Raft
+	applyCh  chan raft.ApplyMsg
+	make_end func(string) *labrpc.ClientEnd
+	gid      int
 	// ctrlers      []*labrpc.ClientEnd
-	ctrler          *shardctrler.Clerk
+	ctrler       *shardctrler.Clerk
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
 	applyListeners      []BroadcastChan
-	applyListenersMutex sync.RWMutex
+	applyListenersMutex deadlock.RWMutex
 
-	data          map[string]string
-	dataMutex     sync.RWMutex
-	snapshotMutex sync.RWMutex
+	data      map[string]string
+	dataMutex deadlock.RWMutex
+	// snapshotMutex deadlock.RWMutex
 
 	serialNos map[int64]int64
 
 	config        shardctrler.Config
-	configMutex   sync.RWMutex
-	inMigration   int32
-	migrationCond *sync.Cond
+	configMutex   deadlock.RWMutex
+	clerkInfo     ClerkHeader
 }
 
 // I wish there is tuple
@@ -62,17 +58,16 @@ func removeBroadcastCh(s []BroadcastChan, i int) []BroadcastChan {
 	return s[:len(s)-1]
 }
 
-
 type Op struct {
 	// Your data here.
-	Name string
-	Args interface{}
+	Name      string
+	Args      interface{}
 	ClerkInfo ClerkHeader
 }
 
 func (kv *ShardKV) get(key string) (value string, err Err) {
-	kv.snapshotMutex.RLock()
-	defer kv.snapshotMutex.RUnlock()
+	// kv.snapshotMutex.RLock()
+	// defer kv.snapshotMutex.RUnlock()
 	kv.dataMutex.RLock()
 	defer kv.dataMutex.RUnlock()
 	value, ok := kv.data[key]
@@ -81,12 +76,13 @@ func (kv *ShardKV) get(key string) (value string, err Err) {
 	} else {
 		err = ErrNoKey
 	}
+	log.Info(kv.gid, "-", kv.me, " get ", key, ": ", kv.data[key])
 	return value, err
 }
 
 func (kv *ShardKV) putAppend(key string, value string, op string) {
-	kv.snapshotMutex.RLock()
-	defer kv.snapshotMutex.RUnlock()
+	// kv.snapshotMutex.RLock()
+	// defer kv.snapshotMutex.RUnlock()
 	kv.dataMutex.Lock()
 	defer kv.dataMutex.Unlock()
 	switch op {
@@ -100,10 +96,35 @@ func (kv *ShardKV) putAppend(key string, value string, op string) {
 			kv.data[key] = value
 		}
 	}
+	log.Info(kv.gid, "-", kv.me, " putAppend ", key, ": ", kv.data[key])
 }
 
+func (kv *ShardKV) reconfigure(config shardctrler.Config, shardData map[string]string) {
+	kv.dataMutex.Lock()
+	defer kv.dataMutex.Unlock()
+	for k, v := range shardData {
+		kv.data[k] = v
+	}
+	kv.configMutex.Lock()
+	defer kv.configMutex.Unlock()
+	kv.config = config
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
+	// Check clerk config num first
+	// If my config is not up-to-date, wait.
+	// But for simplicity, just return ErrWrongGroup and let clerk retry.
+	kv.configMutex.RLock()
+	// merely for debugging
+	confNum := kv.config.Num
+	if args.Header.ConfigNo > kv.config.Num {
+		reply.Err = ErrWrongGroup
+		kv.configMutex.RUnlock()
+		return
+	} else {
+		kv.configMutex.RUnlock()
+	}
+
 	// Check shard first
 	if !kv.isMyShard(key2shard(args.Body.Key)) {
 		reply.Err = ErrWrongGroup
@@ -130,7 +151,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
-	}).Info(kv.me, " Get ", fmt.Sprintf("%+v", args))
+		"configNo": confNum,
+	}).Info(kv.gid, "-", kv.me, " Get ", fmt.Sprintf("%+v", args))
 	kv.applyListenersMutex.Unlock()
 	// Determine whether applyMsg matches command.
 	// Case 1: entry at index is what we submitted.
@@ -153,6 +175,18 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	// Check clerk config num first
+	// If my config is not up-to-date, wait.
+	// But for simplicity, just return ErrWrongGroup and let clerk retry.
+	kv.configMutex.RLock()
+	if args.Header.ConfigNo > kv.config.Num {
+		reply.Err = ErrWrongGroup
+		kv.configMutex.RUnlock()
+		return
+	} else {
+		kv.configMutex.RUnlock()
+	}
+
 	// Check shard first
 	if !kv.isMyShard(key2shard(args.Body.Key)) {
 		reply.Err = ErrWrongGroup
@@ -185,7 +219,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
-	}).Info(kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
+	}).Info(kv.gid, "-", kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
 	kv.applyListenersMutex.Unlock()
 
 	for {
@@ -196,6 +230,52 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			} else {
 				reply.Err = ErrWrongLeader
 				return
+			}
+		}
+	}
+}
+
+
+type ReconfigureArgs struct {
+	Config shardctrler.Config
+	ShardData map[string]string
+}
+
+// Log reconfiguration and requested shard data
+func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]string) bool {
+	// This function only returns false when I am no longer leader
+	// Check whether I am leader
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		return false
+	}
+
+	atomic.AddInt64(&kv.clerkInfo.SerialNo, 1)
+	op := Op{Name: "Reconfigure", Args: ReconfigureArgs{Config: config, ShardData: shardData}, ClerkInfo: kv.clerkInfo}
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false
+	}
+
+	var ls BroadcastChan
+	ls.indexCh = make(chan IndexAndTerm)
+	ls.exitCh = make(chan struct{})
+	defer close(ls.exitCh)
+	kv.applyListenersMutex.Lock()
+	kv.applyListeners = append(kv.applyListeners, ls)
+	log.WithFields(log.Fields{
+		"index": index,
+		"term":  term,
+	}).Info(kv.gid, "-", kv.me, " Reconfigure ", fmt.Sprintf("%+v", op))
+	kv.applyListenersMutex.Unlock()
+
+	for {
+		indexWithTerm := <-ls.indexCh
+		if indexWithTerm.index == (int64)(index) {
+			if indexWithTerm.term == (int64)(term) {
+				return true
+			} else {
+				return false
 			}
 		}
 	}
@@ -258,9 +338,12 @@ func (kv *ShardKV) RequestShards(args *RequestShardsArgs, reply *RequestShardsRe
 	}
 }
 
-func (kv *ShardKV) updateShards(oldConf shardctrler.Config, newConf shardctrler.Config) {
-	// log.Info(kv.me, " old config: ", oldConf)
-	// log.Info(kv.me, " new config: ", newConf)
+func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Config) map[string]string {
+
+	// If old config is the first one, return empty shard data
+	if oldConf.Num == 0 {
+		return make(map[string]string)
+	}
 
 	absentShards := func(oldShards []int, newShards []int) map[int][]int {
 		myOld := make([]int, 0)
@@ -269,7 +352,7 @@ func (kv *ShardKV) updateShards(oldConf shardctrler.Config, newConf shardctrler.
 				myOld = append(myOld, s)
 			}
 		}
-		
+
 		// map old gid to shards
 		myAbsent := make(map[int][]int)
 		for s, g := range newShards {
@@ -319,65 +402,59 @@ func (kv *ShardKV) updateShards(oldConf shardctrler.Config, newConf shardctrler.
 		go getShards(g, ss, oldConf.Groups, resultCh)
 	}
 
+	requestedShardData := make(map[string]string)
 	for i := 0; i < len(absentShards); i++ {
-		shardsData := <- resultCh
-		kv.dataMutex.Lock()
+		shardsData := <-resultCh
 		for k, v := range shardsData {
-			kv.data[k] = v
+			requestedShardData[k] = v
 		}
-		kv.dataMutex.Unlock()
 	}
+	return requestedShardData
 }
 
 func (kv *ShardKV) configDetector() {
 	for {
-		// Query ctrler about latest config
-		latestConfig := kv.ctrler.Query(-1)
-		
-		// Config changed
-		if latestConfig.Num > kv.config.Num {
-			// stop applying new msg
-			atomic.StoreInt32(&kv.inMigration, 1)
-			// Request shards' data from other groups
+		// Query only if I am leader
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			// Query ctrler about latest config
+			latestConfig := kv.ctrler.Query(-1)
+			// log.Info(kv.gid, "-", kv.me, " LatestConfig: ", latestConfig)
+
+			// Config changed
 			kv.configMutex.RLock()
-			if kv.config.Num > 0 {
-				kv.updateShards(kv.config, latestConfig)
+			if latestConfig.Num > kv.config.Num {
+				// Request shards' data from other groups
+				// log.Info(kv.gid, "-", kv.me, " MyConfigNum: ", kv.config)
+				shardData := kv.getShards(kv.config, latestConfig)
+				kv.configMutex.RUnlock()
+				// log.Info(kv.gid, "-", kv.me, " ShardData: ", shardData)
+				kv.Reconfigure(latestConfig, shardData)
+			} else {
+				kv.configMutex.RUnlock()
 			}
-			kv.configMutex.RUnlock()
-
-			kv.configMutex.Lock()
-			kv.config = latestConfig
-			kv.configMutex.Unlock()
-
-			kv.migrationCond.L.Lock()
-			atomic.StoreInt32(&kv.inMigration, 0)
-			kv.migrationCond.Broadcast()
-			kv.migrationCond.L.Unlock()
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-
 func (kv *ShardKV) applier() {
 	for msg := range kv.applyCh {
-		kv.migrationCond.L.Lock()
-		if atomic.LoadInt32(&kv.inMigration) == 1 {
-			kv.migrationCond.Wait()
-		}
-		kv.migrationCond.L.Unlock()
-		
 		if msg.CommandValid {
 			switch c := msg.Command.(type) {
 			case Op:
 				clerkId := c.ClerkInfo.ClerkId
-				
+
 				// Check whether serialNo for this clerk exists
 				_, ok := kv.serialNos[clerkId]
 				if !ok {
 					kv.serialNos[clerkId] = 0
 				}
 
+				log.WithFields(log.Fields{
+					"index":    msg.CommandIndex,
+					"serialNo": kv.serialNos[clerkId],
+				}).Info(kv.gid, "-", kv.me, " Command : ", fmt.Sprintf("%+v", c))
 				// Only apply command if msg's serialNo is larger than recorded one so that duplicate command won't be applied
 				if c.ClerkInfo.SerialNo > kv.serialNos[clerkId] {
 					switch c.Name {
@@ -388,12 +465,19 @@ func (kv *ShardKV) applier() {
 							panic("failed to assert args as JoinArgsBody")
 						}
 						kv.putAppend(args.Key, args.Value, args.Op)
+					case "Reconfigure":
+						args, ok := c.Args.(ReconfigureArgs)
+						if !ok {
+							panic("failed to assert args as ReconfigureArgs")
+						}
+						kv.reconfigure(args.Config, args.ShardData)
 					}
+					kv.serialNos[clerkId] = c.ClerkInfo.SerialNo
 					// kv.configMutex.RLock()
 					// log.WithFields(log.Fields{
-						// "id": kv.me,
-						// "index": msg.CommandIndex,
-					// }).Info(kv.configs[len(kv.configs) - 1])
+					// "id": kv.me,
+					// "index": msg.CommandIndex,
+					// }).Info(c)
 					// kv.configMutex.RUnlock()
 				}
 			case bool:
@@ -412,14 +496,14 @@ func (kv *ShardKV) applier() {
 
 			// Check raft persister size. Concurrent version.
 			// if atomic.LoadInt32(&kv.isSnapshoting) == 0 && kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
-				// kv.snapshotStateMutex.Lock()
-				// if atomic.LoadInt32(&kv.isSnapshoting) == 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
-				    // atomic.StoreInt32(&kv.isSnapshoting, 1)
-				    // snapshotData := kv.createSnapshot()
-				    // kv.rf.Snapshot(msg.CommandIndex, snapshotData)
-				    // atomic.StoreInt32(&kv.isSnapshoting, 0)
-				// }
-				// kv.snapshotStateMutex.Unlock()
+			// kv.snapshotStateMutex.Lock()
+			// if atomic.LoadInt32(&kv.isSnapshoting) == 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+			// atomic.StoreInt32(&kv.isSnapshoting, 1)
+			// snapshotData := kv.createSnapshot()
+			// kv.rf.Snapshot(msg.CommandIndex, snapshotData)
+			// atomic.StoreInt32(&kv.isSnapshoting, 0)
+			// }
+			// kv.snapshotStateMutex.Unlock()
 			// }
 		} else if msg.SnapshotValid {
 			// Receive snapshot
@@ -440,13 +524,11 @@ func (kv *ShardKV) applier() {
 		waitToRemove := make([]int, 0, 1)
 		kv.applyListenersMutex.RLock()
 		for i, v := range kv.applyListeners {
-			// log.Info(kv.me, " before notifying one listener about index update")
 			select {
 			case v.indexCh <- indexToNotify:
 			case <-v.exitCh:
 				waitToRemove = append(waitToRemove, i)
 			}
-			// log.Info(kv.me, " notified one listener about index update")
 		}
 		kv.applyListenersMutex.RUnlock()
 		kv.applyListenersMutex.Lock()
@@ -458,8 +540,8 @@ func (kv *ShardKV) applier() {
 }
 
 func (kv *ShardKV) createSnapshot() []byte {
-	kv.snapshotMutex.RLock()
-	defer kv.snapshotMutex.RUnlock()
+	kv.dataMutex.RLock()
+	defer kv.dataMutex.RUnlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.data)
@@ -471,8 +553,8 @@ func (kv *ShardKV) createSnapshot() []byte {
 func (kv *ShardKV) applySnapshot(snapshotData []byte) {
 	r := bytes.NewBuffer(snapshotData)
 	d := labgob.NewDecoder(r)
-	kv.snapshotMutex.Lock()
-	defer kv.snapshotMutex.Unlock()
+	kv.dataMutex.RLock()
+	defer kv.dataMutex.RUnlock()
 	newData := make(map[string]string, 0)
 	newSerialNos := make(map[int64]int64)
 	if d.Decode(&newData) != nil ||
@@ -483,7 +565,6 @@ func (kv *ShardKV) applySnapshot(snapshotData []byte) {
 		kv.serialNos = newSerialNos
 	}
 }
-
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -530,6 +611,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(ClerkHeader{})
 	labgob.Register(GetArgsBody{})
 	labgob.Register(PutAppendArgsBody{})
+	labgob.Register(ReconfigureArgs{})
 
 	// Use something like this to talk to the shardctrler:
 	kv.ctrler = shardctrler.MakeClerk(ctrlers)
@@ -539,12 +621,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.serialNos = make(map[int64]int64)
 	kv.config = kv.ctrler.Query(-1)
+	kv.clerkInfo = ClerkHeader{ClerkId: time.Now().UnixNano(), SerialNo: 0, ConfigNo: -1}
+	log.Info(kv.gid, "-", kv.me, " config:", kv.config)
 	kv.data = make(map[string]string)
-	kv.inMigration = 0
-	kv.migrationCond = sync.NewCond(&sync.Mutex{})
 	go kv.configDetector()
 	go kv.applier()
-
 
 	return kv
 }

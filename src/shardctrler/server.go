@@ -435,10 +435,10 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	defer close(ls.exitCh)
 	sc.applyListenersMutex.Lock()
 	sc.applyListeners = append(sc.applyListeners, ls)
-	log.WithFields(log.Fields{
-		"index": index,
-		"term":  term,
-	}).Info(sc.me, " Query ", fmt.Sprintf("%+v", args))
+	// log.WithFields(log.Fields{
+		// "index": index,
+		// "term":  term,
+	// }).Info(sc.me, " Query ", fmt.Sprintf("%+v", args))
 	sc.applyListenersMutex.Unlock()
 	// Determine whether applyMsg matches command.
 	// Case 1: entry at index is what we submitted.
@@ -515,6 +515,7 @@ func (sc *ShardCtrler) applier() {
 						sc.move(args.Shard, args.GID)
 					case "Query":
 					}
+					sc.serialNos[clerkId] = c.ClerkInfo.SerialNo
 					// sc.configMutex.RLock()
 					// log.WithFields(log.Fields{
 						// "id": sc.me,

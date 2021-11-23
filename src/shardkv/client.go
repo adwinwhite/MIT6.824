@@ -80,6 +80,7 @@ func (ck *Clerk) Get(key string) string {
 	args := GetArgs{Header: ClerkHeader{ClerkId: ck.uid, SerialNo: atomic.AddInt64(&ck.serialNo, 1)}, Body: GetArgsBody{Key: key}}
 
 	for {
+		args.Header.ConfigNo = ck.config.Num
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -114,6 +115,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 
 	for {
+		args.Header.ConfigNo = ck.config.Num
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {

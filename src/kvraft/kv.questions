@@ -213,3 +213,5 @@
 
 38. When sending logEntries, nextIndex may have 0 length? Why?
 	Role is set before nextIndex is initialized.
+
+39. Why clerk doesn't block forever when the leader loses its status during handling Get/PutAppend()?
