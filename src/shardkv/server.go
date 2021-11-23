@@ -40,6 +40,8 @@ type ShardKV struct {
 	config        shardctrler.Config
 	configMutex   deadlock.RWMutex
 	clerkInfo     ClerkHeader
+	configNo      int  // only used for bar rpc handlers
+	configNoMutex deadlock.RWMutex
 }
 
 // I wish there is tuple
@@ -111,28 +113,36 @@ func (kv *ShardKV) reconfigure(config shardctrler.Config, shardData map[string]s
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Check clerk config num first
-	// If my config is not up-to-date, wait.
-	// But for simplicity, just return ErrWrongGroup and let clerk retry.
-	kv.configMutex.RLock()
-	// merely for debugging
-	confNum := kv.config.Num
-	if args.Header.ConfigNo > kv.config.Num {
-		reply.Err = ErrWrongGroup
-		kv.configMutex.RUnlock()
-		return
-	} else {
-		kv.configMutex.RUnlock()
-	}
-
-	// Check shard first
-	if !kv.isMyShard(key2shard(args.Body.Key)) {
-		reply.Err = ErrWrongGroup
-		return
-	}
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// Check clerk config num after leader checking
+	// If my config is not up-to-date, wait.
+	// But for simplicity, just return ErrWrongGroup and let clerk retry.
+	// kv.configMutex.RLock()
+	kv.configNoMutex.RLock()
+	// merely for debugging
+	confNum := kv.configNo
+	if args.Header.ConfigNo != kv.configNo {
+		log.WithFields(log.Fields{
+			"argsConfNo": args.Header.ConfigNo,
+			"myConfNo": confNum,
+		}).Error(kv.gid, "-", kv.me, " Get outdated config")
+		reply.Err = ErrOutdatedConfig
+		// kv.configMutex.RUnlock()
+		kv.configNoMutex.RUnlock()
+		return
+	} else {
+		kv.configNoMutex.RUnlock()
+		// kv.configMutex.RUnlock()
+	}
+
+	// Check shard then
+	if !kv.isMyShard(key2shard(args.Body.Key)) {
+		reply.Err = ErrWrongGroup
 		return
 	}
 
@@ -175,23 +185,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Check clerk config num first
-	// If my config is not up-to-date, wait.
-	// But for simplicity, just return ErrWrongGroup and let clerk retry.
-	kv.configMutex.RLock()
-	if args.Header.ConfigNo > kv.config.Num {
-		reply.Err = ErrWrongGroup
-		kv.configMutex.RUnlock()
-		return
-	} else {
-		kv.configMutex.RUnlock()
-	}
-
-	// Check shard first
-	if !kv.isMyShard(key2shard(args.Body.Key)) {
-		reply.Err = ErrWrongGroup
-		return
-	}
 
 	// Reply Ok by default.
 	reply.Err = OK
@@ -200,6 +193,32 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// Check clerk config num after leader check
+	// If my config is not up-to-date, wait.
+	// But for simplicity, just return ErrWrongGroup and let clerk retry.
+	kv.configNoMutex.RLock()
+	// merely for debugging
+	confNum := kv.configNo
+	if args.Header.ConfigNo != kv.configNo {
+		log.WithFields(log.Fields{
+			"argsConfNo": args.Header.ConfigNo,
+			"myConfNo": confNum,
+		}).Error(kv.gid, "-", kv.me, " PutAppend outdated config")
+		reply.Err = ErrOutdatedConfig
+		// kv.configMutex.RUnlock()
+		kv.configNoMutex.RUnlock()
+		return
+	} else {
+		kv.configNoMutex.RUnlock()
+		// kv.configMutex.RUnlock()
+	}
+
+	// Check shard first
+	if !kv.isMyShard(key2shard(args.Body.Key)) {
+		reply.Err = ErrWrongGroup
 		return
 	}
 
@@ -219,6 +238,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
+		"configNo": confNum,
 	}).Info(kv.gid, "-", kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
 	kv.applyListenersMutex.Unlock()
 
@@ -252,7 +272,12 @@ func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]s
 
 	atomic.AddInt64(&kv.clerkInfo.SerialNo, 1)
 	op := Op{Name: "Reconfigure", Args: ReconfigureArgs{Config: config, ShardData: shardData}, ClerkInfo: kv.clerkInfo}
+	// Update config here to prevent applying outdated PutAppend.
+	kv.configNoMutex.Lock()
 	index, term, isLeader := kv.rf.Start(op)
+	kv.configNo = config.Num
+	kv.configNoMutex.Unlock()
+
 	if !isLeader {
 		return false
 	}
@@ -303,6 +328,7 @@ func (kv *ShardKV) isMyShard(s int) bool {
 
 type RequestShardsArgs struct {
 	Shards []int
+	ConfigNum int
 }
 
 type RequestShardsReply struct {
@@ -311,6 +337,20 @@ type RequestShardsReply struct {
 }
 
 func (kv *ShardKV) RequestShards(args *RequestShardsArgs, reply *RequestShardsReply) {
+	// Check whether my config is outdated
+	kv.configMutex.RLock()
+	// for debugging
+	log.WithFields(log.Fields{
+		"configNo": kv.config.Num,
+	}).Info(kv.gid, "-", kv.me, " RequestShardsArgs: ", args)
+	if kv.config.Num < args.ConfigNum {
+		reply.Err = ErrOutdatedConfig
+		kv.configMutex.RUnlock()
+		return
+	} else {
+		kv.configMutex.RUnlock()
+	}
+
 	reply.Err = OK
 	// Check whether I am leader
 	_, isLeader := kv.rf.GetState()
@@ -367,15 +407,16 @@ func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Con
 				if !exists {
 					if myAbsent[oldShards[s]] == nil {
 						myAbsent[oldShards[s]] = append([]int(nil), s)
+					} else {
+						myAbsent[oldShards[s]] = append(myAbsent[oldShards[s]], s)
 					}
-					myAbsent[oldShards[s]] = append(myAbsent[oldShards[s]], s)
 				}
 			}
 		}
 		return myAbsent
 	}(oldConf.Shards[:], newConf.Shards[:])
 
-	// log.Info(kv.me, " absent shards: ", absentShards)
+	log.Info(kv.gid, "-", kv.me, " absent shards: ", absentShards)
 
 	resultCh := make(chan map[string]string)
 
@@ -384,15 +425,21 @@ func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Con
 		if !ok {
 			panic("No such gid")
 		}
-		args := RequestShardsArgs{Shards: shards}
+		args := RequestShardsArgs{Shards: shards, ConfigNum: newConf.Num}
 		for {
 			for _, srv := range servers {
 				peer := kv.make_end(srv)
 				var reply RequestShardsReply
 				ok = peer.Call("ShardKV.RequestShards", &args, &reply)
-				if ok && reply.Err == OK {
-					resCh <- reply.ShardsData
-					return
+				if ok { 
+					switch reply.Err {
+					case OK:
+						resCh <- reply.ShardsData
+						return
+					case ErrOutdatedConfig:
+						time.Sleep(10 * time.Millisecond)
+					case ErrWrongLeader:
+					}
 				}
 			}
 		}
@@ -418,17 +465,17 @@ func (kv *ShardKV) configDetector() {
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
 			// Query ctrler about latest config
-			latestConfig := kv.ctrler.Query(-1)
+			kv.configMutex.RLock()
+			latestConfig := kv.ctrler.Query(kv.config.Num + 1)
 			// log.Info(kv.gid, "-", kv.me, " LatestConfig: ", latestConfig)
 
 			// Config changed
-			kv.configMutex.RLock()
 			if latestConfig.Num > kv.config.Num {
 				// Request shards' data from other groups
 				// log.Info(kv.gid, "-", kv.me, " MyConfigNum: ", kv.config)
 				shardData := kv.getShards(kv.config, latestConfig)
 				kv.configMutex.RUnlock()
-				// log.Info(kv.gid, "-", kv.me, " ShardData: ", shardData)
+				log.Info(kv.gid, "-", kv.me, " ShardData: ", shardData)
 				kv.Reconfigure(latestConfig, shardData)
 			} else {
 				kv.configMutex.RUnlock()
@@ -621,6 +668,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.serialNos = make(map[int64]int64)
 	kv.config = kv.ctrler.Query(-1)
+	kv.configNo = kv.config.Num
 	kv.clerkInfo = ClerkHeader{ClerkId: time.Now().UnixNano(), SerialNo: 0, ConfigNo: -1}
 	log.Info(kv.gid, "-", kv.me, " config:", kv.config)
 	kv.data = make(map[string]string)

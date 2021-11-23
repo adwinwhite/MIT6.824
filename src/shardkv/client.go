@@ -15,6 +15,9 @@ import "6.824/shardctrler"
 import "time"
 import "sync"
 import "sync/atomic"
+import (
+	log "github.com/sirupsen/logrus"
+)
 
 //
 // which shard is a key in?
@@ -95,6 +98,9 @@ func (ck *Clerk) Get(key string) string {
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
 				}
+				if ok && reply.Err == ErrOutdatedConfig {
+					break
+				}
 				// ... not ok, or ErrWrongLeader
 			}
 		}
@@ -122,11 +128,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
+				log.Info("clerk: ", args)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				log.Info("clerk: Call() is ok? ", reply)
+
 				if ok && reply.Err == OK {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					break
+				}
+				if ok && reply.Err == ErrOutdatedConfig {
 					break
 				}
 				// ... not ok, or ErrWrongLeader

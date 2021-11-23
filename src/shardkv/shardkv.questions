@@ -1,0 +1,76 @@
+1. When to query Config?
+
+2. How can we remove lock on clerk while perserving linearizability?
+
+3. How do servers know which shards to serve?
+	Use ctrler to query? When?
+
+4. How do servers and clerks know whether their configs are up-to-date?
+
+5. How can we get shards from groups that left?
+	Leaving does not mean dead.
+
+6. How to ensure at-most-once with multiple groups? SerialNos only works on a single group?
+	Share serialNos between groups? How to avoid sync delay?
+
+7. Why some keys always lost part of value? They were there when appended.
+	They are answered by different groups.
+		Only first version is migrated?
+		Nnn. It's answered by first host. Update to key is not synced by first host.
+		Nnn. It's synced. Just the new leader in the group still keeps the old value.
+		If a server dies before snapshotting, its shards from other groups won't be kept.
+			Snapshots instantly after updating shards. 
+				if maxraftstate is -1, you can't use snapshot.
+			If it dies during migration, restart the migration.
+				What if the group who previously serves the shards also dies and do not have requested shards?
+					Then we have no way of getting up-to-date shards.
+			Use Put command to commit requested data? Then only leader needs to detect config.
+				How to ensure all data is commited?
+					Check index?
+
+
+
+8. In rpc handler, we should check clerk's config Num before proceeding?
+	Case > server's: query and updateShards.
+	Case < server's: if shard is not here, return ErrWrongGroup.
+
+9. How do we persist requested shards data?
+	Log reconfiguration with obtained shard data.
+	Then followers don't need to detect config change?
+
+10. Requested data should be complete.
+	Contains whole changes from previous config.
+	No cyclic dependency. (guaranteed by balancing algorithm and Move mechanics)
+
+11. I just found out that requested data is empty when it shouldn't be.
+
+12. Groups in old config may not have up-to-date data if old config's Num differs from new's by more than 1.
+	I got it.
+	Just servers just update config one by one.
+		Which is kind of wasteful. Lots of unnecessary data migration.
+
+13. Found duplicate shards in absentShards.
+	Some wanted shards not received.
+	Some unwanted shards received.
+		I mistake shard for key.
+
+14. Requested data is not up-to-date.
+
+
+15. It seems that 100 is still handling rpc whose key doesn't match.
+	I got it.
+	Clerk with old config can work with up-to-date server. (which cause inconsistency)
+		Fix: answers only when config num is the same.
+
+16. What if requested data is dirty since previous server modifies it again?
+
+
+17. PutAppend happened after reconfiguration. Thus new host do not know it. (it is appended successfully because both previous server and clerk have config.Num = latest - 1)
+	Well, you can check configNo again in applier(). And you may remove checking in rpc handler?
+	Or we update config right after Start(reconfiguration)?
+		Good. linearizability is guaranteed by applier() order.
+		Bad. when requesting data, new host thought you had complete data but you actually didn't.
+	Use a seperate configNo variable to bar rpc handler?
+		Seems good.
+
+18. Followers' config may have lag. Use leader to handle all RPCs.
