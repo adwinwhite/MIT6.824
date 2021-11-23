@@ -74,3 +74,11 @@
 		Seems good.
 
 18. Followers' config may have lag. Use leader to handle all RPCs.
+
+19. After reboot, all my data become dirty? Since other servers may write to it.
+	Case single server down: no problem. 
+	Case whole group leaves: all data become dirty.
+		When rejoining, init all servers with latestConfig's shardData? Nnn, the shardData is empty anyway.
+			So we should clean all data before rejoining.
+			Or when leaving. Nnn, its data is perhaps still transfering.
+			Or clean previous shards data when merge shards.

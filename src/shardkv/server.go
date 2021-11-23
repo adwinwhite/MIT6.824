@@ -104,10 +104,23 @@ func (kv *ShardKV) putAppend(key string, value string, op string) {
 func (kv *ShardKV) reconfigure(config shardctrler.Config, shardData map[string]string) {
 	kv.dataMutex.Lock()
 	defer kv.dataMutex.Unlock()
+	// Clean possible outdated data if I newly joined.
+	// Check whether I was active before 
+	kv.configMutex.Lock()
+	isActive := false
+	for _, g := range kv.config.Shards {
+		if g == kv.gid {
+			isActive = true
+			break
+		}
+	}
+	if !isActive {
+		kv.data = make(map[string]string)
+	}
+
 	for k, v := range shardData {
 		kv.data[k] = v
 	}
-	kv.configMutex.Lock()
 	defer kv.configMutex.Unlock()
 	kv.config = config
 }
