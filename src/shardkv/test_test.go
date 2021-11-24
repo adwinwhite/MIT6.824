@@ -480,9 +480,12 @@ func TestConcurrent3(t *testing.T) {
 		defer func() { ch <- true }()
 		for atomic.LoadInt32(&done) == 0 {
 			x := randstring(1)
+			log.Info("before append ", i)
 			ck1.Append(ka[i], x)
+			log.Info("after append ", i)
 			va[i] += x
 		}
+		log.Info("Finished ", i)
 	}
 
 	for i := 0; i < n; i++ {
@@ -514,8 +517,8 @@ func TestConcurrent3(t *testing.T) {
 	log.Info("Done")
 	for i := 0; i < n; i++ {
 		<-ch
+		log.Info("Received ", i)
 	}
-	log.Info("Received")
 
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])

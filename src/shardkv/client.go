@@ -124,6 +124,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		args.Header.ConfigNo = ck.config.Num
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		log.WithFields(log.Fields{
+			"clerkId": ck.uid,
+			"serialNo": ck.serialNo,
+		}).Info(" Sending PutAppend RPC to group ", gid)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])

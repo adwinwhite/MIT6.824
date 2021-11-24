@@ -92,3 +92,20 @@
 20. How to garbage collect serialNos? Is it necessary?
 
 21. Why does leader election fail?
+	
+
+22. The server snapshots at every commit.(in Concurrent3)
+	Command has too large size?
+
+
+23. Blocked somewhere in TestConcurrent3. There is one goroutine not sending signal to channel.
+	Channel?
+	Append()?
+		But no output from here. Weird.
+	Call()?
+
+	I got it.
+		Command is applied before listener is initialzed.
+			fix: add listener before Start()
+				applyCh blocked.
+				configMutex Rlock vs lock!

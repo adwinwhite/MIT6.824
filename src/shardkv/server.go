@@ -177,25 +177,29 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		// return
 	// }
 
-	op := Op{Name: "Get", Args: args.Body, ClerkInfo: args.Header}
-	index, term, isLeader := kv.rf.Start(op)
-	kv.configNoMutex.RUnlock()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
+	// Add listener before sending Command to prevent that command gets applied too fast.
 	var ls BroadcastChan
 	ls.indexCh = make(chan IndexAndTerm)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
+	kv.applyListenersMutex.Unlock()
+
+	op := Op{Name: "Get", Args: args.Body, ClerkInfo: args.Header}
+	index, term, isLeader := kv.rf.Start(op)
+
+	kv.configNoMutex.RUnlock()
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
 		"configNo": confNum,
 	}).Info(kv.gid, "-", kv.me, " Get ", fmt.Sprintf("%+v", args))
-	kv.applyListenersMutex.Unlock()
 	// Determine whether applyMsg matches command.
 	// Case 1: entry at index is what we submitted.
 	// Case 2: entry at index is not what we submitted due to the leader died or lost leadership before propagating this entry.
@@ -256,26 +260,31 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// return
 	// }
 
-	op := Op{Name: "PutAppend", Args: args.Body, ClerkInfo: args.Header}
-	index, term, isLeader := kv.rf.Start(op)
-	kv.configNoMutex.RUnlock()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
 
+	// Add listener before sending Command to prevent that command gets applied too fast.
 	var ls BroadcastChan
 	ls.indexCh = make(chan IndexAndTerm)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
 	kv.applyListeners = append(kv.applyListeners, ls)
+	kv.applyListenersMutex.Unlock()
+
+	op := Op{Name: "PutAppend", Args: args.Body, ClerkInfo: args.Header}
+	index, term, isLeader := kv.rf.Start(op)
+
+	kv.configNoMutex.RUnlock()
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
 		"configNo": confNum,
 	}).Info(kv.gid, "-", kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
-	kv.applyListenersMutex.Unlock()
 
 	for {
 		indexWithTerm := <-ls.indexCh
@@ -306,6 +315,14 @@ func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]s
 		return false
 	}
 
+	var ls BroadcastChan
+	ls.indexCh = make(chan IndexAndTerm)
+	ls.exitCh = make(chan struct{})
+	defer close(ls.exitCh)
+	kv.applyListenersMutex.Lock()
+	kv.applyListeners = append(kv.applyListeners, ls)
+	kv.applyListenersMutex.Unlock()
+
 	atomic.AddInt64(&kv.clerkInfo.SerialNo, 1)
 	op := Op{Name: "Reconfigure", Args: ReconfigureArgs{Config: config, ShardData: shardData, SerialNos: serialNos}, ClerkInfo: kv.clerkInfo}
 	// Update config here to prevent applying outdated PutAppend.
@@ -314,21 +331,16 @@ func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]s
 	kv.configNo = config.Num
 	kv.configNoMutex.Unlock()
 
+
 	if !isLeader {
 		return false
 	}
 
-	var ls BroadcastChan
-	ls.indexCh = make(chan IndexAndTerm)
-	ls.exitCh = make(chan struct{})
-	defer close(ls.exitCh)
-	kv.applyListenersMutex.Lock()
-	kv.applyListeners = append(kv.applyListeners, ls)
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
 	}).Info(kv.gid, "-", kv.me, " Reconfigure ", fmt.Sprintf("%+v", op))
-	kv.applyListenersMutex.Unlock()
+
 
 	for {
 		indexWithTerm := <-ls.indexCh
@@ -591,6 +603,10 @@ func (kv *ShardKV) applier() {
 					// "index": msg.CommandIndex,
 					// }).Info(c)
 					// kv.configMutex.RUnlock()
+					log.WithFields(log.Fields{
+						"index":    msg.CommandIndex,
+						"serialNo": kv.serialNos[clerkId],
+					}).Info(kv.gid, "-", kv.me, " After applying command ")
 				}
 				kv.dataMutex.Unlock()
 			case bool:
@@ -603,8 +619,14 @@ func (kv *ShardKV) applier() {
 			}
 
 			if kv.maxraftstate > 0 && kv.rf.Persister().RaftStateSize() > kv.maxraftstate {
+				log.WithFields(log.Fields{
+					"myRaftSize": kv.rf.Persister().RaftStateSize(),
+					"maxRaftState": kv.maxraftstate,
+				}).Info(kv.gid, "-", kv.me, " tries to snapshot ")
 				snapshotData := kv.createSnapshot()
 				kv.rf.Snapshot(msg.CommandIndex, snapshotData)
+				log.WithFields(log.Fields{
+				}).Info(kv.gid, "-", kv.me, " After snapshotting")
 			}
 
 			// Check raft persister size. Concurrent version.
@@ -649,6 +671,8 @@ func (kv *ShardKV) applier() {
 			kv.applyListeners = removeBroadcastCh(kv.applyListeners, waitToRemove[i])
 		}
 		kv.applyListenersMutex.Unlock()
+		log.WithFields(log.Fields{
+		}).Info(kv.gid, "-", kv.me, " After notifying listeners")
 	}
 }
 
