@@ -130,7 +130,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				log.Info("clerk: ", args)
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				log.Info("clerk: Call() is ok? ", reply)
+				log.WithFields(log.Fields{
+					"clerkId": ck.uid,
+					"serialNo": ck.serialNo,
+				}).Info("clerk: Call() is ok? ", reply)
 
 				if ok && reply.Err == OK {
 					return

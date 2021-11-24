@@ -1118,9 +1118,9 @@ func (rf *Raft) sendApplyMsg() {
 	if rf.lastApplied + 1 < rf.logFirstIndex {
 		// Send snapshot
 		msg := ApplyMsg{CommandValid: false, SnapshotValid: true, Snapshot: rf.snapshotData, SnapshotIndex: (int)(rf.logFirstIndex - 1), SnapshotTerm: (int)(rf.lastIncludedTerm)}
+		rf.lastApplied = rf.logFirstIndex - 1
 		rf.logMutex.RUnlock()
 		rf.applyCh <- msg
-		rf.lastApplied = rf.logFirstIndex - 1
 	} else {
 		// Send log entries from lastApplied + 1 to commitIndex
 		msgs := make([]ApplyMsg, currentCommitIndex - rf.lastApplied)

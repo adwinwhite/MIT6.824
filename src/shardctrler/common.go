@@ -28,7 +28,7 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
-func (c *Config) deepcopy() Config {
+func (c *Config) Deepcopy() Config {
 	newConfig := Config{}
 	newConfig.Num = c.Num
 	newConfig.Shards = c.Shards

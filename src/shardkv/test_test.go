@@ -10,6 +10,7 @@ import "sync/atomic"
 import "sync"
 import "math/rand"
 import "io/ioutil"
+import log "github.com/sirupsen/logrus"
 
 const linearizabilityCheckTimeout = 1 * time.Second
 
@@ -510,9 +511,11 @@ func TestConcurrent3(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	atomic.StoreInt32(&done, 1)
+	log.Info("Done")
 	for i := 0; i < n; i++ {
 		<-ch
 	}
+	log.Info("Received")
 
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])

@@ -200,7 +200,7 @@ func balanceShards(shards *[NShards]int, servers map[int][]string) {
 func (sc *ShardCtrler) join(servers map[int][]string) {
 	sc.configMutex.Lock()
 	defer sc.configMutex.Unlock()
-	newConfig := sc.configs[len(sc.configs) - 1].deepcopy()
+	newConfig := sc.configs[len(sc.configs) - 1].Deepcopy()
 	newConfig.Num = len(sc.configs)
 
 	for k := range servers {
@@ -223,7 +223,7 @@ func (sc *ShardCtrler) join(servers map[int][]string) {
 func (sc *ShardCtrler) leave(gids []int) {
 	sc.configMutex.Lock()
 	defer sc.configMutex.Unlock()
-	newConfig := sc.configs[len(sc.configs) - 1].deepcopy()
+	newConfig := sc.configs[len(sc.configs) - 1].Deepcopy()
 	newConfig.Num = len(sc.configs)
 
 	for _, id := range gids {
@@ -238,7 +238,7 @@ func (sc *ShardCtrler) leave(gids []int) {
 func (sc *ShardCtrler) move(shard int, gid int) {
 	sc.configMutex.Lock()
 	defer sc.configMutex.Unlock()
-	newConfig := sc.configs[len(sc.configs) - 1].deepcopy()
+	newConfig := sc.configs[len(sc.configs) - 1].Deepcopy()
 	newConfig.Num = len(sc.configs)
 	newConfig.Shards[shard] = gid
 	sc.configs = append(sc.configs, newConfig)

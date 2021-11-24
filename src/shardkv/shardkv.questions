@@ -12,6 +12,9 @@
 
 6. How to ensure at-most-once with multiple groups? SerialNos only works on a single group?
 	Share serialNos between groups? How to avoid sync delay?
+	Request serialNos as well as shard data? But serialNo may be over new.
+	Since RequestShards is async to applier(), it's certain that there is inconsistency with serialNos.
+		Just use a lock to sync data with serialNos.
 
 7. Why some keys always lost part of value? They were there when appended.
 	They are answered by different groups.
@@ -84,3 +87,8 @@
 			So we should clean all data before rejoining.
 			Or when leaving. Nnn, its data is perhaps still transfering.
 			Or clean previous shards data when merge shards.
+		Maybe it's not a problem? When rejoining, the group will get new shards as well as shard data and them will overwrite dirty data.
+
+20. How to garbage collect serialNos? Is it necessary?
+
+21. Why does leader election fail?

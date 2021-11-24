@@ -35,6 +35,7 @@ type ShardKV struct {
 	dataMutex deadlock.RWMutex
 	// snapshotMutex deadlock.RWMutex
 
+	// Use dataMutex to protect serialNos as well
 	serialNos map[int64]int64
 
 	config        shardctrler.Config
@@ -85,8 +86,8 @@ func (kv *ShardKV) get(key string) (value string, err Err) {
 func (kv *ShardKV) putAppend(key string, value string, op string) {
 	// kv.snapshotMutex.RLock()
 	// defer kv.snapshotMutex.RUnlock()
-	kv.dataMutex.Lock()
-	defer kv.dataMutex.Unlock()
+	// kv.dataMutex.Lock()
+	// defer kv.dataMutex.Unlock()
 	switch op {
 	case "Put":
 		kv.data[key] = value
@@ -101,27 +102,43 @@ func (kv *ShardKV) putAppend(key string, value string, op string) {
 	log.Info(kv.gid, "-", kv.me, " putAppend ", key, ": ", kv.data[key])
 }
 
-func (kv *ShardKV) reconfigure(config shardctrler.Config, shardData map[string]string) {
-	kv.dataMutex.Lock()
-	defer kv.dataMutex.Unlock()
-	// Clean possible outdated data if I newly joined.
-	// Check whether I was active before 
+func (kv *ShardKV) reconfigure(config shardctrler.Config, shardData map[string]string, serialNos map[int64]int64) {
+	// kv.dataMutex.Lock()
+	// defer kv.dataMutex.Unlock()
 	kv.configMutex.Lock()
-	isActive := false
-	for _, g := range kv.config.Shards {
-		if g == kv.gid {
-			isActive = true
-			break
-		}
+	defer kv.configMutex.Unlock()
+
+	// Config num should be increasing. Ignore outdated config.
+	if config.Num <= kv.config.Num {
+		return
 	}
-	if !isActive {
-		kv.data = make(map[string]string)
-	}
+
+	// Clean possible outdated data if I newly joined. Maybe there is no need. Dirty data will be overwritten.
+	// Check whether I was active before. 
+	// isActive := false
+	// for _, g := range kv.config.Shards {
+		// if g == kv.gid {
+			// isActive = true
+			// break
+		// }
+	// }
+	// if !isActive {
+		// kv.data = make(map[string]string)
+	// }
 
 	for k, v := range shardData {
 		kv.data[k] = v
 	}
-	defer kv.configMutex.Unlock()
+	for k, v := range serialNos {
+		n, ok := kv.serialNos[k]
+		if !ok {
+			kv.serialNos[k] = v
+		} else {
+			if v > n {
+				kv.serialNos[k] = v
+			}
+		}
+	}
 	kv.config = config
 }
 
@@ -149,18 +166,20 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		kv.configNoMutex.RUnlock()
 		return
 	} else {
-		kv.configNoMutex.RUnlock()
+		// kv.configNoMutex.RUnlock()
 		// kv.configMutex.RUnlock()
 	}
 
 	// Check shard then
-	if !kv.isMyShard(key2shard(args.Body.Key)) {
-		reply.Err = ErrWrongGroup
-		return
-	}
+	// if !kv.isMyShard(key2shard(args.Body.Key)) {
+		// reply.Err = ErrWrongGroup
+		// kv.configNoMutex.RUnlock()
+		// return
+	// }
 
 	op := Op{Name: "Get", Args: args.Body, ClerkInfo: args.Header}
 	index, term, isLeader := kv.rf.Start(op)
+	kv.configNoMutex.RUnlock()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -225,18 +244,21 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.configNoMutex.RUnlock()
 		return
 	} else {
-		kv.configNoMutex.RUnlock()
+		// kv.configNoMutex.RUnlock()
 		// kv.configMutex.RUnlock()
 	}
 
 	// Check shard first
-	if !kv.isMyShard(key2shard(args.Body.Key)) {
-		reply.Err = ErrWrongGroup
-		return
-	}
+	// No need to check shard anymore if config nums are the same?
+	// if !kv.isMyShard(key2shard(args.Body.Key)) {
+		// reply.Err = ErrWrongGroup
+		// kv.configNoMutex.RUnlock()
+		// return
+	// }
 
 	op := Op{Name: "PutAppend", Args: args.Body, ClerkInfo: args.Header}
 	index, term, isLeader := kv.rf.Start(op)
+	kv.configNoMutex.RUnlock()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -272,10 +294,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 type ReconfigureArgs struct {
 	Config shardctrler.Config
 	ShardData map[string]string
+	SerialNos map[int64]int64
 }
 
 // Log reconfiguration and requested shard data
-func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]string) bool {
+func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]string, serialNos map[int64]int64) bool {
 	// This function only returns false when I am no longer leader
 	// Check whether I am leader
 	_, isLeader := kv.rf.GetState()
@@ -284,7 +307,7 @@ func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]s
 	}
 
 	atomic.AddInt64(&kv.clerkInfo.SerialNo, 1)
-	op := Op{Name: "Reconfigure", Args: ReconfigureArgs{Config: config, ShardData: shardData}, ClerkInfo: kv.clerkInfo}
+	op := Op{Name: "Reconfigure", Args: ReconfigureArgs{Config: config, ShardData: shardData, SerialNos: serialNos}, ClerkInfo: kv.clerkInfo}
 	// Update config here to prevent applying outdated PutAppend.
 	kv.configNoMutex.Lock()
 	index, term, isLeader := kv.rf.Start(op)
@@ -346,6 +369,7 @@ type RequestShardsArgs struct {
 
 type RequestShardsReply struct {
 	ShardsData map[string]string
+	SerialNos  map[int64]int64
 	Err        Err
 }
 
@@ -354,7 +378,7 @@ func (kv *ShardKV) RequestShards(args *RequestShardsArgs, reply *RequestShardsRe
 	kv.configMutex.RLock()
 	// for debugging
 	log.WithFields(log.Fields{
-		"configNo": kv.config.Num,
+		"MyConfigNo": kv.config.Num,
 	}).Info(kv.gid, "-", kv.me, " RequestShardsArgs: ", args)
 	if kv.config.Num < args.ConfigNum {
 		reply.Err = ErrOutdatedConfig
@@ -389,13 +413,18 @@ func (kv *ShardKV) RequestShards(args *RequestShardsArgs, reply *RequestShardsRe
 			reply.ShardsData[k] = v
 		}
 	}
+
+	reply.SerialNos = make(map[int64]int64)
+	for k, v := range kv.serialNos {
+		reply.SerialNos[k] = v
+	}
 }
 
-func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Config) map[string]string {
+func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Config) (map[string]string, map[int64]int64) {
 
 	// If old config is the first one, return empty shard data
 	if oldConf.Num == 0 {
-		return make(map[string]string)
+		return make(map[string]string), make(map[int64]int64)
 	}
 
 	absentShards := func(oldShards []int, newShards []int) map[int][]int {
@@ -431,9 +460,10 @@ func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Con
 
 	log.Info(kv.gid, "-", kv.me, " absent shards: ", absentShards)
 
-	resultCh := make(chan map[string]string)
+	// resultCh := make(chan map[string]string)
+	resultCh := make(chan RequestShardsReply)
 
-	getShards := func(gid int, shards []int, groups map[int][]string, resCh chan map[string]string) {
+	getShards := func(gid int, shards []int, groups map[int][]string, resCh chan RequestShardsReply) {
 		servers, ok := groups[gid]
 		if !ok {
 			panic("No such gid")
@@ -447,7 +477,7 @@ func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Con
 				if ok { 
 					switch reply.Err {
 					case OK:
-						resCh <- reply.ShardsData
+						resCh <- reply
 						return
 					case ErrOutdatedConfig:
 						time.Sleep(10 * time.Millisecond)
@@ -463,13 +493,23 @@ func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Con
 	}
 
 	requestedShardData := make(map[string]string)
+	correspondingSerialNos := make(map[int64]int64)
 	for i := 0; i < len(absentShards); i++ {
-		shardsData := <-resultCh
-		for k, v := range shardsData {
+		reply := <-resultCh
+		for k, v := range reply.ShardsData {
 			requestedShardData[k] = v
 		}
+		for k, v := range reply.SerialNos {
+			_, ok := correspondingSerialNos[k]
+			if !ok {
+				correspondingSerialNos[k] = 0
+			}
+			if v > correspondingSerialNos[k] {
+				correspondingSerialNos[k] = v
+			}
+		}
 	}
-	return requestedShardData
+	return requestedShardData, correspondingSerialNos
 }
 
 func (kv *ShardKV) configDetector() {
@@ -480,8 +520,8 @@ func (kv *ShardKV) configDetector() {
 			// Query ctrler about latest config
 			kv.configMutex.RLock()
 			latestConfig := kv.ctrler.Query(kv.config.Num + 1)
-			// log.Info(kv.gid, "-", kv.me, " LatestConfig: ", latestConfig)
-			// log.Info(kv.gid, "-", kv.me, " MyConfig: ", kv.config)
+			log.Info(kv.gid, "-", kv.me, " LatestConfig: ", latestConfig)
+			log.Info(kv.gid, "-", kv.me, " MyConfig: ", kv.config)
 
 			// When a follower become leader, its configNo needs updating.
 			kv.configNoMutex.Lock()
@@ -494,15 +534,18 @@ func (kv *ShardKV) configDetector() {
 			if latestConfig.Num > kv.config.Num {
 				// Request shards' data from other groups
 				// log.Info(kv.gid, "-", kv.me, " MyConfigNum: ", kv.config)
-				shardData := kv.getShards(kv.config, latestConfig)
+				// Use a copy to avoid deadlock When transfering data in both directions.
+				// Set config is sequential by Reconfigure(). So there should be no problem?
+				myConfig := kv.config.Deepcopy()
 				kv.configMutex.RUnlock()
+				shardData, serialNos := kv.getShards(myConfig, latestConfig)
 				log.Info(kv.gid, "-", kv.me, " ShardData: ", shardData)
-				kv.Reconfigure(latestConfig, shardData)
+				kv.Reconfigure(latestConfig, shardData, serialNos)
 			} else {
 				kv.configMutex.RUnlock()
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(40 * time.Millisecond)
 	}
 }
 
@@ -519,6 +562,7 @@ func (kv *ShardKV) applier() {
 					kv.serialNos[clerkId] = 0
 				}
 
+				kv.dataMutex.Lock()
 				log.WithFields(log.Fields{
 					"index":    msg.CommandIndex,
 					"serialNo": kv.serialNos[clerkId],
@@ -538,7 +582,7 @@ func (kv *ShardKV) applier() {
 						if !ok {
 							panic("failed to assert args as ReconfigureArgs")
 						}
-						kv.reconfigure(args.Config, args.ShardData)
+						kv.reconfigure(args.Config, args.ShardData, args.SerialNos)
 					}
 					kv.serialNos[clerkId] = c.ClerkInfo.SerialNo
 					// kv.configMutex.RLock()
@@ -548,6 +592,7 @@ func (kv *ShardKV) applier() {
 					// }).Info(c)
 					// kv.configMutex.RUnlock()
 				}
+				kv.dataMutex.Unlock()
 			case bool:
 				log.WithFields(log.Fields{
 					"index": msg.CommandIndex,
@@ -624,8 +669,10 @@ func (kv *ShardKV) createSnapshot() []byte {
 func (kv *ShardKV) applySnapshot(snapshotData []byte) {
 	r := bytes.NewBuffer(snapshotData)
 	d := labgob.NewDecoder(r)
-	kv.dataMutex.RLock()
-	defer kv.dataMutex.RUnlock()
+	kv.dataMutex.Lock()
+	defer kv.dataMutex.Unlock()
+	kv.configMutex.Lock()
+	defer kv.configMutex.Unlock()
 	newData := make(map[string]string, 0)
 	newSerialNos := make(map[int64]int64)
 	var newConfig shardctrler.Config
