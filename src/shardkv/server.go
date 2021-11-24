@@ -481,6 +481,14 @@ func (kv *ShardKV) configDetector() {
 			kv.configMutex.RLock()
 			latestConfig := kv.ctrler.Query(kv.config.Num + 1)
 			// log.Info(kv.gid, "-", kv.me, " LatestConfig: ", latestConfig)
+			// log.Info(kv.gid, "-", kv.me, " MyConfig: ", kv.config)
+
+			// When a follower become leader, its configNo needs updating.
+			kv.configNoMutex.Lock()
+			if kv.configNo < kv.config.Num {
+				kv.configNo = kv.config.Num
+			}
+			kv.configNoMutex.Unlock()
 
 			// Config changed
 			if latestConfig.Num > kv.config.Num {
@@ -602,10 +610,13 @@ func (kv *ShardKV) applier() {
 func (kv *ShardKV) createSnapshot() []byte {
 	kv.dataMutex.RLock()
 	defer kv.dataMutex.RUnlock()
+	kv.configMutex.RLock()
+	defer kv.configMutex.RUnlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.data)
 	e.Encode(kv.serialNos)
+	e.Encode(kv.config)
 	data := w.Bytes()
 	return data
 }
@@ -617,12 +628,15 @@ func (kv *ShardKV) applySnapshot(snapshotData []byte) {
 	defer kv.dataMutex.RUnlock()
 	newData := make(map[string]string, 0)
 	newSerialNos := make(map[int64]int64)
+	var newConfig shardctrler.Config
 	if d.Decode(&newData) != nil ||
-		d.Decode(&newSerialNos) != nil {
+		d.Decode(&newSerialNos) != nil || 
+		d.Decode(&newConfig) != nil {
 		panic("failed to decode kv data")
 	} else {
 		kv.data = newData
 		kv.serialNos = newSerialNos
+		kv.config = newConfig
 	}
 }
 
@@ -680,7 +694,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.serialNos = make(map[int64]int64)
-	kv.config = kv.ctrler.Query(-1)
+	// recover from zero
+	kv.config = kv.ctrler.Query(0)
 	kv.configNo = kv.config.Num
 	kv.clerkInfo = ClerkHeader{ClerkId: time.Now().UnixNano(), SerialNo: 0, ConfigNo: -1}
 	log.Info(kv.gid, "-", kv.me, " config:", kv.config)

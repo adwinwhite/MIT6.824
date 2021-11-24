@@ -72,6 +72,8 @@
 		Bad. when requesting data, new host thought you had complete data but you actually didn't.
 	Use a seperate configNo variable to bar rpc handler?
 		Seems good.
+		When a follower becomes leader in a group, it may not have up-to-date configNo.
+			fix: set it in detector rather than in Reconfigure.
 
 18. Followers' config may have lag. Use leader to handle all RPCs.
 
