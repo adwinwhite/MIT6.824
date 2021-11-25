@@ -46,13 +46,14 @@ type ShardKV struct {
 }
 
 // I wish there is tuple
-type IndexAndTerm struct {
+type ApplyResult struct {
 	index int64
 	term  int64
+	err   Err
 }
 
 type BroadcastChan struct {
-	indexCh chan IndexAndTerm
+	indexCh chan ApplyResult
 	exitCh  chan struct{}
 }
 
@@ -153,22 +154,22 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// If my config is not up-to-date, wait.
 	// But for simplicity, just return ErrWrongGroup and let clerk retry.
 	// kv.configMutex.RLock()
-	kv.configNoMutex.RLock()
-	// merely for debugging
-	confNum := kv.configNo
-	if args.Header.ConfigNo != kv.configNo {
-		log.WithFields(log.Fields{
-			"argsConfNo": args.Header.ConfigNo,
-			"myConfNo": confNum,
-		}).Error(kv.gid, "-", kv.me, " Get outdated config")
-		reply.Err = ErrOutdatedConfig
-		// kv.configMutex.RUnlock()
-		kv.configNoMutex.RUnlock()
-		return
-	} else {
+	// kv.configNoMutex.RLock()
+	// // merely for debugging
+	// confNum := kv.configNo
+	// if args.Header.ConfigNo != kv.configNo {
+		// log.WithFields(log.Fields{
+			// "argsConfNo": args.Header.ConfigNo,
+			// "myConfNo": confNum,
+		// }).Error(kv.gid, "-", kv.me, " Get outdated config")
+		// reply.Err = ErrOutdatedConfig
+		// // kv.configMutex.RUnlock()
 		// kv.configNoMutex.RUnlock()
-		// kv.configMutex.RUnlock()
-	}
+		// return
+	// } else {
+		// // kv.configNoMutex.RUnlock()
+		// // kv.configMutex.RUnlock()
+	// }
 
 	// Check shard then
 	// if !kv.isMyShard(key2shard(args.Body.Key)) {
@@ -179,7 +180,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	// Add listener before sending Command to prevent that command gets applied too fast.
 	var ls BroadcastChan
-	ls.indexCh = make(chan IndexAndTerm)
+	ls.indexCh = make(chan ApplyResult)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
@@ -189,7 +190,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	op := Op{Name: "Get", Args: args.Body, ClerkInfo: args.Header}
 	index, term, isLeader := kv.rf.Start(op)
 
-	kv.configNoMutex.RUnlock()
+	// kv.configNoMutex.RUnlock()
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -198,7 +199,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
-		"configNo": confNum,
+		// "configNo": confNum,
 	}).Info(kv.gid, "-", kv.me, " Get ", fmt.Sprintf("%+v", args))
 	// Determine whether applyMsg matches command.
 	// Case 1: entry at index is what we submitted.
@@ -206,10 +207,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Just check term of entry at index.
 	// What if it's a snapshot? Leader only sends snapshot at restart. Index of snapshot is guaranteed to be smaller than what we need.
 	for {
-		indexWithTerm := <-ls.indexCh
-		// Is there a chance that indexWithTerm.index is greater than index?
-		if indexWithTerm.index == (int64)(index) {
-			if indexWithTerm.term == (int64)(term) {
+		applyResult := <-ls.indexCh
+		// Is there a chance that applyResult.index is greater than index?
+		if applyResult.index == (int64)(index) {
+			if applyResult.term == (int64)(term) {
+				// Retry if configNo is outdated.
+				if applyResult.err == ErrOutdatedConfig {
+					reply.Err = ErrOutdatedConfig
+					return
+				}
 				reply.Value, reply.Err = kv.get(args.Body.Key)
 				return
 			} else {
@@ -235,22 +241,22 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Check clerk config num after leader check
 	// If my config is not up-to-date, wait.
 	// But for simplicity, just return ErrWrongGroup and let clerk retry.
-	kv.configNoMutex.RLock()
-	// merely for debugging
-	confNum := kv.configNo
-	if args.Header.ConfigNo != kv.configNo {
-		log.WithFields(log.Fields{
-			"argsConfNo": args.Header.ConfigNo,
-			"myConfNo": confNum,
-		}).Error(kv.gid, "-", kv.me, " PutAppend outdated config")
-		reply.Err = ErrOutdatedConfig
-		// kv.configMutex.RUnlock()
-		kv.configNoMutex.RUnlock()
-		return
-	} else {
+	// kv.configNoMutex.RLock()
+	// // merely for debugging
+	// confNum := kv.configNo
+	// if args.Header.ConfigNo != kv.configNo {
+		// log.WithFields(log.Fields{
+			// "argsConfNo": args.Header.ConfigNo,
+			// "myConfNo": confNum,
+		// }).Error(kv.gid, "-", kv.me, " PutAppend outdated config")
+		// reply.Err = ErrOutdatedConfig
+		// // kv.configMutex.RUnlock()
 		// kv.configNoMutex.RUnlock()
-		// kv.configMutex.RUnlock()
-	}
+		// return
+	// } else {
+		// // kv.configNoMutex.RUnlock()
+		// // kv.configMutex.RUnlock()
+	// }
 
 	// Check shard first
 	// No need to check shard anymore if config nums are the same?
@@ -263,7 +269,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	// Add listener before sending Command to prevent that command gets applied too fast.
 	var ls BroadcastChan
-	ls.indexCh = make(chan IndexAndTerm)
+	ls.indexCh = make(chan ApplyResult)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
@@ -273,7 +279,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op := Op{Name: "PutAppend", Args: args.Body, ClerkInfo: args.Header}
 	index, term, isLeader := kv.rf.Start(op)
 
-	kv.configNoMutex.RUnlock()
+	// kv.configNoMutex.RUnlock()
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -283,13 +289,17 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	log.WithFields(log.Fields{
 		"index": index,
 		"term":  term,
-		"configNo": confNum,
+		// "configNo": confNum,
 	}).Info(kv.gid, "-", kv.me, " PutAppend ", fmt.Sprintf("%+v", args))
 
 	for {
-		indexWithTerm := <-ls.indexCh
-		if indexWithTerm.index == (int64)(index) {
-			if indexWithTerm.term == (int64)(term) {
+		applyResult := <-ls.indexCh
+		if applyResult.index == (int64)(index) {
+			if applyResult.term == (int64)(term) {
+				if applyResult.err == ErrOutdatedConfig {
+					reply.Err = ErrOutdatedConfig
+					return
+				}
 				return
 			} else {
 				reply.Err = ErrWrongLeader
@@ -316,7 +326,7 @@ func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]s
 	}
 
 	var ls BroadcastChan
-	ls.indexCh = make(chan IndexAndTerm)
+	ls.indexCh = make(chan ApplyResult)
 	ls.exitCh = make(chan struct{})
 	defer close(ls.exitCh)
 	kv.applyListenersMutex.Lock()
@@ -326,10 +336,10 @@ func (kv *ShardKV) Reconfigure(config shardctrler.Config, shardData map[string]s
 	atomic.AddInt64(&kv.clerkInfo.SerialNo, 1)
 	op := Op{Name: "Reconfigure", Args: ReconfigureArgs{Config: config, ShardData: shardData, SerialNos: serialNos}, ClerkInfo: kv.clerkInfo}
 	// Update config here to prevent applying outdated PutAppend.
-	kv.configNoMutex.Lock()
+	// kv.configNoMutex.Lock()
 	index, term, isLeader := kv.rf.Start(op)
-	kv.configNo = config.Num
-	kv.configNoMutex.Unlock()
+	// kv.configNo = config.Num
+	// kv.configNoMutex.Unlock()
 
 
 	if !isLeader {
@@ -389,9 +399,7 @@ func (kv *ShardKV) RequestShards(args *RequestShardsArgs, reply *RequestShardsRe
 	// Check whether my config is outdated
 	kv.configMutex.RLock()
 	// for debugging
-	log.WithFields(log.Fields{
-		"MyConfigNo": kv.config.Num,
-	}).Info(kv.gid, "-", kv.me, " RequestShardsArgs: ", args)
+	confNo := kv.config.Num
 	if kv.config.Num < args.ConfigNum {
 		reply.Err = ErrOutdatedConfig
 		kv.configMutex.RUnlock()
@@ -407,6 +415,9 @@ func (kv *ShardKV) RequestShards(args *RequestShardsArgs, reply *RequestShardsRe
 		reply.Err = ErrWrongLeader
 		return
 	}
+	log.WithFields(log.Fields{
+		"MyConfigNo": confNo,
+	}).Info(kv.gid, "-", kv.me, " RequestShardsArgs: ", args)
 
 	kv.dataMutex.RLock()
 	defer kv.dataMutex.RUnlock()
@@ -486,6 +497,8 @@ func (kv *ShardKV) getShards(oldConf shardctrler.Config, newConf shardctrler.Con
 				peer := kv.make_end(srv)
 				var reply RequestShardsReply
 				ok = peer.Call("ShardKV.RequestShards", &args, &reply)
+				log.Info(kv.gid, "-", kv.me, " getShards reply: ", reply)
+
 				if ok { 
 					switch reply.Err {
 					case OK:
@@ -536,11 +549,11 @@ func (kv *ShardKV) configDetector() {
 			log.Info(kv.gid, "-", kv.me, " MyConfig: ", kv.config)
 
 			// When a follower become leader, its configNo needs updating.
-			kv.configNoMutex.Lock()
-			if kv.configNo < kv.config.Num {
-				kv.configNo = kv.config.Num
-			}
-			kv.configNoMutex.Unlock()
+			// kv.configNoMutex.Lock()
+			// if kv.configNo < kv.config.Num {
+				// kv.configNo = kv.config.Num
+			// }
+			// kv.configNoMutex.Unlock()
 
 			// Config changed
 			if latestConfig.Num > kv.config.Num {
@@ -563,22 +576,39 @@ func (kv *ShardKV) configDetector() {
 
 func (kv *ShardKV) applier() {
 	for msg := range kv.applyCh {
+		var applyResult ApplyResult
+		applyResult.err = OK
 		if msg.CommandValid {
 			switch c := msg.Command.(type) {
 			case Op:
 				clerkId := c.ClerkInfo.ClerkId
+
+				// Check whether configNo is outdated.
+				// -1 means it's Reconfigure(). Valid.
+				kv.configMutex.RLock()
+
+				log.WithFields(log.Fields{
+					"index":    msg.CommandIndex,
+					"serialNo": kv.serialNos[clerkId],
+					"myConfigNo": kv.config.Num,
+				}).Info(kv.gid, "-", kv.me, " Command : ", fmt.Sprintf("%+v", c))
+
+				if c.ClerkInfo.ConfigNo != -1 && c.ClerkInfo.ConfigNo != kv.config.Num {
+					applyResult.err = ErrOutdatedConfig
+					kv.configMutex.RUnlock()
+					break
+				} else {
+					kv.configMutex.RUnlock()
+				}
+
+
 
 				// Check whether serialNo for this clerk exists
 				_, ok := kv.serialNos[clerkId]
 				if !ok {
 					kv.serialNos[clerkId] = 0
 				}
-
 				kv.dataMutex.Lock()
-				log.WithFields(log.Fields{
-					"index":    msg.CommandIndex,
-					"serialNo": kv.serialNos[clerkId],
-				}).Info(kv.gid, "-", kv.me, " Command : ", fmt.Sprintf("%+v", c))
 				// Only apply command if msg's serialNo is larger than recorded one so that duplicate command won't be applied
 				if c.ClerkInfo.SerialNo > kv.serialNos[clerkId] {
 					switch c.Name {
@@ -622,6 +652,7 @@ func (kv *ShardKV) applier() {
 				log.WithFields(log.Fields{
 					"myRaftSize": kv.rf.Persister().RaftStateSize(),
 					"maxRaftState": kv.maxraftstate,
+					"lastIncludedIndex": msg.CommandIndex,
 				}).Info(kv.gid, "-", kv.me, " tries to snapshot ")
 				snapshotData := kv.createSnapshot()
 				kv.rf.Snapshot(msg.CommandIndex, snapshotData)
@@ -643,24 +674,26 @@ func (kv *ShardKV) applier() {
 		} else if msg.SnapshotValid {
 			// Receive snapshot
 			kv.applySnapshot(msg.Snapshot)
+			log.WithFields(log.Fields{
+				"lastIncludedIndex": msg.SnapshotIndex,
+			}).Info(kv.gid, "-", kv.me, " Snapshot Applied ")
 		} else {
 			continue
 		}
 
 		// Notify all listeners about index&term of msg
-		var indexToNotify IndexAndTerm
 		if msg.CommandValid {
-			indexToNotify.index = (int64)(msg.CommandIndex)
-			indexToNotify.term = msg.CommandTerm
+			applyResult.index = (int64)(msg.CommandIndex)
+			applyResult.term = msg.CommandTerm
 		} else if msg.SnapshotValid {
-			indexToNotify.index = (int64)(msg.SnapshotIndex)
-			indexToNotify.term = (int64)(msg.SnapshotTerm)
+			applyResult.index = (int64)(msg.SnapshotIndex)
+			applyResult.term = (int64)(msg.SnapshotTerm)
 		}
 		waitToRemove := make([]int, 0, 1)
 		kv.applyListenersMutex.RLock()
 		for i, v := range kv.applyListeners {
 			select {
-			case v.indexCh <- indexToNotify:
+			case v.indexCh <- applyResult:
 			case <-v.exitCh:
 				waitToRemove = append(waitToRemove, i)
 			}
@@ -767,7 +800,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.serialNos = make(map[int64]int64)
 	// recover from zero
 	kv.config = kv.ctrler.Query(0)
-	kv.configNo = kv.config.Num
+	// kv.configNo = kv.config.Num
 	kv.clerkInfo = ClerkHeader{ClerkId: time.Now().UnixNano(), SerialNo: 0, ConfigNo: -1}
 	log.Info(kv.gid, "-", kv.me, " config:", kv.config)
 	kv.data = make(map[string]string)

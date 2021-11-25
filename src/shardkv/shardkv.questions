@@ -77,6 +77,8 @@
 		Seems good.
 		When a follower becomes leader in a group, it may not have up-to-date configNo.
 			fix: set it in detector rather than in Reconfigure.
+				It doesn't know about latest Reconfigure() has been called.
+			fix: check configNo in applier() and send success or failure to listener. And we don't need a sepearte configNo anymore. 
 
 18. Followers' config may have lag. Use leader to handle all RPCs.
 
@@ -109,3 +111,9 @@
 			fix: add listener before Start()
 				applyCh blocked.
 				configMutex Rlock vs lock!
+
+24. Clerk received OK when command wasn't even applied.
+	Command wasn't executed even if configNo and serialNo are valid. What the hell happended? Just a single command was missing.
+		Due to shutdown and restart?
+			Then the clerk should get ok=false.
+			Rpc returned ok even if the server is down?
